@@ -24,12 +24,30 @@ app.use(cors());
 
 app.post("/api/health-data", async (req, res) => {
   try {
+    // 🔍 raw payload snapshot log (cut to 2000 chars to avoid log spam)
+    console.log(
+      "[/api/health-data] Incoming payload snapshot:",
+      JSON.stringify(req.body).slice(0, 2000)
+    );
+
     const payload = req.body;
     const metrics = payload?.data?.metrics || [];
+
+    // basic stats
+    console.log(
+      "[/api/health-data] Metrics count:",
+      Array.isArray(metrics) ? metrics.length : "no metrics array"
+    );
 
     // user mapping: ?uid=... অথবা body.user_id থেকে
     const userId = req.query.uid || req.body.user_id;
     if (!userId) {
+      console.warn(
+        "[/api/health-data] Missing user_id/uid. Query.uid =",
+        req.query.uid,
+        "body.user_id =",
+        req.body?.user_id
+      );
       return res.status(400).json({ error: "Missing user_id/uid" });
     }
 
@@ -69,6 +87,28 @@ app.post("/api/health-data", async (req, res) => {
 
     for (const metric of metrics) {
       const name = (metric.name || "").toLowerCase();
+
+      // অচেনা metric detect করার জন্য light log
+      const knownNames = [
+        "resting_heart_rate",
+        "heart_rate_variability_sdnn",
+        "step_count",
+        "active_energy_burned",
+        "basal_energy_burned",
+        "body_mass",
+        "body_fat_percentage",
+        "blood_glucose",
+        "blood_pressure_systolic",
+        "blood_pressure_diastolic",
+        "sleep_analysis",
+      ];
+      const isKnown = knownNames.some((k) => name.includes(k));
+      if (!isKnown) {
+        console.log(
+          "[/api/health-data] Unknown metric name from Auto Export:",
+          metric.name
+        );
+      }
 
       for (const d of metric.data || []) {
         const dateStr = d.date || d.start || d.startDate;
@@ -154,17 +194,40 @@ app.post("/api/health-data", async (req, res) => {
     const rows = Object.values(summary);
 
     if (rows.length === 0) {
+      console.warn(
+        "[/api/health-data] No valid summary rows generated. Metrics length:",
+        Array.isArray(metrics) ? metrics.length : "no metrics",
+        "Payload snapshot:",
+        JSON.stringify(payload).slice(0, 2000)
+      );
       return res.json({ message: "No valid data to insert" });
     }
+
+    console.log(
+      "[/api/health-data] Prepared summary rows for dates:",
+      rows.map((r) => r.date)
+    );
 
     const { data, error } = await supabase
       .from("daily_health_summary")
       .upsert(rows, { onConflict: "user_id,date" }); // UNIQUE(user_id,date)
 
     if (error) {
-      console.error("[/api/health-data] Supabase error:", error);
+      console.error(
+        "[/api/health-data] Supabase error while upserting rows for dates:",
+        rows.map((r) => r.date),
+        "Error:",
+        error
+      );
       return res.status(500).json({ error: error.message });
     }
+
+    console.log(
+      "[/api/health-data] Upsert success. user_id:",
+      userId,
+      "rows:",
+      rows.length
+    );
 
     return res.json({
       message: "Success",
@@ -172,7 +235,10 @@ app.post("/api/health-data", async (req, res) => {
       dates: rows.map((r) => r.date).sort(),
     });
   } catch (err) {
-    console.error("[/api/health-data] Unexpected error:", err);
+    console.error(
+      "[/api/health-data] Unexpected error while processing payload:",
+      err
+    );
     return res
       .status(500)
       .json({ error: "Server error", details: err.message });
