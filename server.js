@@ -53,9 +53,24 @@ app.post("/api/health-data", async (req, res) => {
 
     const summary = {};
 
+    // ✅ FIXED: date format (e.g. "2025-12-03 21:00:00 -0800")
     const ensureDay = (dateStr) => {
-      const day = (dateStr || "").split("T")[0];
-      if (!day || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+      if (!dateStr) return null;
+
+      const trimmed = String(dateStr).trim();
+
+      // প্রথম ১০ ক্যারেক্টার নিলে সরাসরি "YYYY-MM-DD"
+      const first10 = trimmed.slice(0, 10); // e.g. "2025-12-03"
+      let day = null;
+
+      if (/^\d{4}-\d{2}-\d{2}$/.test(first10)) {
+        day = first10;
+      } else {
+        // fallback: Date parser try করি
+        const parsed = new Date(trimmed);
+        if (isNaN(parsed)) return null;
+        day = parsed.toISOString().slice(0, 10);
+      }
 
       if (!summary[day]) {
         summary[day] = {
@@ -92,8 +107,10 @@ app.post("/api/health-data", async (req, res) => {
       const knownNames = [
         "resting_heart_rate",
         "heart_rate_variability_sdnn",
+        "heart_rate_variability",   // ✅ নতুন
         "step_count",
         "active_energy_burned",
+        "active_energy",            // ✅ নতুন
         "basal_energy_burned",
         "body_mass",
         "body_fat_percentage",
@@ -102,7 +119,7 @@ app.post("/api/health-data", async (req, res) => {
         "blood_pressure_diastolic",
         "sleep_analysis",
       ];
-      const isKnown = knownNames.some((k) => name.includes(k));
+      const isKnown = knownNames.some((k) => name.includes(k) || name === k);
       if (!isKnown) {
         console.log(
           "[/api/health-data] Unknown metric name from Auto Export:",
@@ -125,8 +142,11 @@ app.post("/api/health-data", async (req, res) => {
           row.resting_hr = value;
         }
 
-        // 2) HRV
-        if (name.includes("heart_rate_variability_sdnn")) {
+        // 2) HRV (sdnn বা generic heart_rate_variability দুটোই)
+        if (
+          name.includes("heart_rate_variability_sdnn") ||
+          name === "heart_rate_variability"
+        ) {
           row.hrv = value;
         }
 
@@ -135,8 +155,11 @@ app.post("/api/health-data", async (req, res) => {
           row.steps += Number(value || 0);
         }
 
-        // 4) Active calories
-        if (name.includes("active_energy_burned")) {
+        // 4) Active calories (Apple এর active_energy ধরছি)
+        if (
+          name.includes("active_energy_burned") ||
+          name === "active_energy"
+        ) {
           row.active_calories += Number(value || 0);
         }
 
@@ -252,6 +275,9 @@ app.get("/", (req, res) => {
 
 // ---------- Start server (Render uses PORT env) ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`THOR Health API listening on port ${PORT}`);
 });
+
+// ⏱️ Increase server timeout (e.g. 3 minutes)
+server.setTimeout(180000);
