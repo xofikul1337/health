@@ -8,9 +8,7 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseServiceRoleKey) {
-  console.warn(
-    "[server] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars"
-  );
+  console.warn("[server] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars");
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
@@ -19,20 +17,21 @@ const app = express();
 // ---------- Express middleware ----------
 app.use(express.json({ limit: "50mb" }));
 app.use(cors());
+app.set("trust proxy", 1);
+
+// ---------- Readiness Routes (plug-in) ----------
+const readinessRoutes = require("./api/readinessRoutes");
+app.use("/api/readiness", readinessRoutes);
 
 // ---------- Health Auto Export Webhook ----------
 app.post("/api/health-data", async (req, res) => {
   try {
     // 1) Raw snapshot log (limited)
     const rawSnapshot = JSON.stringify(req.body).slice(0, 5000);
-    console.log(
-      "[/api/health-data] RAW payload snapshot (first 5000 chars):",
-      rawSnapshot
-    );
+    console.log("[/api/health-data] RAW payload snapshot (first 5000 chars):", rawSnapshot);
 
     const payload = req.body;
-    const metrics =
-      payload?.data?.metrics || payload?.metrics || [];
+    const metrics = payload?.data?.metrics || payload?.metrics || [];
 
     // 2) User mapping
     const userId = req.query.uid || req.body.user_id;
@@ -44,10 +43,9 @@ app.post("/api/health-data", async (req, res) => {
       "→ final userId =",
       userId
     );
+
     if (!userId) {
-      console.warn(
-        "[/api/health-data] Missing user_id/uid. Rejecting request."
-      );
+      console.warn("[/api/health-data] Missing user_id/uid. Rejecting request.");
       return res.status(400).json({ error: "Missing user_id/uid" });
     }
 
@@ -65,26 +63,19 @@ app.post("/api/health-data", async (req, res) => {
     }
 
     const metricNames = metrics.map((m) => m.name).filter(Boolean);
-    console.log(
-      "[/api/health-data] Metric names:",
-      metricNames
-    );
-
-    console.log(
-      "[/api/health-data] Sample metrics (first 3):",
-      JSON.stringify(metrics.slice(0, 3), null, 2)
-    );
+    console.log("[/api/health-data] Metric names:", metricNames);
+    console.log("[/api/health-data] Sample metrics (first 3):", JSON.stringify(metrics.slice(0, 3), null, 2));
 
     // ---------- Per-day summary aggregator ----------
     const summary = {};
 
     // Apple Health date format: "2025-12-09 00:00:00 -0800"
-    // আমাদের জন্য শুধু "YYYY-MM-DD" দরকার
+    // We only need "YYYY-MM-DD"
     const ensureDay = (dateStr) => {
       if (!dateStr) return null;
 
       const trimmed = String(dateStr).trim();
-      const first10 = trimmed.slice(0, 10); // 2025-12-09
+      const first10 = trimmed.slice(0, 10);
 
       let day = null;
       if (/^\d{4}-\d{2}-\d{2}$/.test(first10)) {
@@ -92,13 +83,13 @@ app.post("/api/health-data", async (req, res) => {
       } else {
         const parsed = new Date(trimmed);
         if (isNaN(parsed)) return null;
-        day = parsed.toISOString().slice(0, 10); // fallback
+        day = parsed.toISOString().slice(0, 10);
       }
 
       if (!summary[day]) {
         summary[day] = {
           user_id: userId,
-          date: day, // Supabase: date
+          date: day,
 
           resting_hr: null,
           hrv: null,
@@ -107,6 +98,7 @@ app.post("/api/health-data", async (req, res) => {
           sleep_deep_minutes: 0,
           sleep_rem_minutes: 0,
           sleep_core_minutes: 0,
+          sleep_awake_minutes: 0, //  add awake minutes (useful for later)
 
           systolic: null,
           diastolic: null,
@@ -125,43 +117,43 @@ app.post("/api/health-data", async (req, res) => {
 
     // ---------- Known metrics list ----------
     const knownNames = [
-      // Core
       "resting_heart_rate",
       "heart_rate_variability_sdnn",
       "heart_rate_variability",
       "step_count",
       "sleep_analysis",
-
-      // Energy
       "active_energy_burned",
       "active_energy",
       "basal_energy_burned",
-
-      // Weight + body comp
       "body_mass",
       "weight_body_mass",
       "body_fat_percentage",
-
-      // Glucose
       "blood_glucose",
-
-      // BP
       "blood_pressure_systolic",
       "blood_pressure_diastolic",
     ];
+
+    // helper: safe add minutes
+    const addMinutes = (row, key, minutes) => {
+      const m = Number(minutes);
+      if (!Number.isFinite(m) || m <= 0) return;
+      row[key] += m;
+    };
+
+    // helper: from "hr" to minutes
+    const hrToMin = (hr) => {
+      const n = Number(hr);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return n * 60;
+    };
 
     // ---------- Main merge loop ----------
     for (const metric of metrics) {
       const name = (metric.name || "").toLowerCase();
 
-      const isKnown = knownNames.some(
-        (k) => name === k || name.includes(k)
-      );
+      const isKnown = knownNames.some((k) => name === k || name.includes(k));
       if (!isKnown) {
-        console.log(
-          "[/api/health-data] Unknown metric name from Auto Export:",
-          metric.name
-        );
+        console.log("[/api/health-data] Unknown metric name from Auto Export:", metric.name);
       }
 
       const dataPoints = metric.data || [];
@@ -174,120 +166,137 @@ app.post("/api/health-data", async (req, res) => {
         const row = ensureDay(dateStr);
         if (!row) continue;
 
-        const value =
-          d.qty ?? d.avg ?? d.value ?? d.min ?? d.max ?? null;
-        if (value == null) continue;
+        const value = d.qty ?? d.avg ?? d.value ?? d.min ?? d.max ?? null;
 
         // 1) Resting HR
-        if (name.includes("resting_heart_rate")) {
+        if (name.includes("resting_heart_rate") && value != null) {
           row.resting_hr = Number(value);
         }
 
-        // 2) HRV (Apple কখনো "heart_rate_variability" নামে দেয়)
+        // 2) HRV
         if (
-          name.includes("heart_rate_variability_sdnn") ||
-          name === "heart_rate_variability"
+          (name.includes("heart_rate_variability_sdnn") || name === "heart_rate_variability") &&
+          value != null
         ) {
           row.hrv = Number(value);
         }
 
-        // 3) Steps (int)
-        if (name.includes("step_count")) {
+        // 3) Steps
+        if (name.includes("step_count") && value != null) {
           row.steps += Number(value || 0);
         }
 
-        // 4) Active calories (int)
-        if (
-          name.includes("active_energy_burned") ||
-          name === "active_energy"
-        ) {
+        // 4) Active calories
+        if ((name.includes("active_energy_burned") || name === "active_energy") && value != null) {
           row.active_calories += Number(value || 0);
         }
 
-        // 5) Basal calories (int)
-        if (name.includes("basal_energy_burned")) {
+        // 5) Basal calories
+        if (name.includes("basal_energy_burned") && value != null) {
           row.basal_calories += Number(value || 0);
         }
 
-        // 6) Weight (kg / lb)
-        if (
-          name.includes("body_mass") ||
-          name.includes("weight_body_mass")
-        ) {
+        // 6) Weight
+        if ((name.includes("body_mass") || name.includes("weight_body_mass")) && value != null) {
           row.weight = Number(value);
         }
 
         // 7) Body fat %
-        if (name.includes("body_fat_percentage")) {
+        if (name.includes("body_fat_percentage") && value != null) {
           row.body_fat_percentage = Number(value);
         }
 
-        // 8) Glucose (mg/dL)
-        if (name.includes("blood_glucose")) {
+        // 8) Glucose
+        if (name.includes("blood_glucose") && value != null) {
           row.glucose = Number(value);
         }
 
         // 9) Blood pressure
-        if (name.includes("blood_pressure_systolic")) {
+        if (name.includes("blood_pressure_systolic") && value != null) {
           row.systolic = Number(value);
         }
-        if (name.includes("blood_pressure_diastolic")) {
+        if (name.includes("blood_pressure_diastolic") && value != null) {
           row.diastolic = Number(value);
         }
 
-        // 10) Sleep (duration + stages)
+        // 10) Sleep ( FIXED: supports BOTH formats)
         if (name.includes("sleep_analysis")) {
-          const start = new Date(d.start || d.startDate || dateStr);
-          const end = new Date(d.end || d.endDate || dateStr);
-          if (isNaN(start) || isNaN(end)) continue;
+          // (A) hr summary object format
+          // Example: { totalSleep: 5.9, deep: 0.88, rem: 1.25, core: 3.77, awake: 0.06, ... }
+          const hasHrSummary =
+            d.totalSleep != null ||
+            d.deep != null ||
+            d.rem != null ||
+            d.core != null ||
+            d.awake != null;
 
-          const minutes = (end - start) / 60000;
-          if (!Number.isFinite(minutes) || minutes <= 0) continue;
+          if (hasHrSummary) {
+            // totalSleep is "asleep time" in hours
+            const totalMin = hrToMin(d.totalSleep);
+            const deepMin = hrToMin(d.deep);
+            const remMin = hrToMin(d.rem);
+            const coreMin = hrToMin(d.core);
+            const awakeMin = hrToMin(d.awake);
 
-          row.sleep_duration_minutes += minutes;
+            // We treat duration as "totalSleep" minutes (not inBed)
+            addMinutes(row, "sleep_duration_minutes", totalMin);
 
-          const stage = d.value;
-          // 0 = awake, 1 = asleep, 2 = core, 3 = deep, 4 = rem
-          if (stage === 3 || String(stage) === "Deep") {
-            row.sleep_deep_minutes += minutes;
-          } else if (stage === 4 || String(stage) === "REM") {
-            row.sleep_rem_minutes += minutes;
-          } else if (stage === 2 || stage === 1) {
-            row.sleep_core_minutes += minutes;
+            // Stages
+            addMinutes(row, "sleep_deep_minutes", deepMin);
+            addMinutes(row, "sleep_rem_minutes", remMin);
+            addMinutes(row, "sleep_core_minutes", coreMin);
+            addMinutes(row, "sleep_awake_minutes", awakeMin);
+
+            continue; //  done for this datapoint
+          }
+
+          // (B) start/end segments format (older approach)
+          const start = new Date(d.start || d.startDate);
+          const end = new Date(d.end || d.endDate);
+          if (!isNaN(start) && !isNaN(end)) {
+            const minutes = (end - start) / 60000;
+            if (Number.isFinite(minutes) && minutes > 0) {
+              addMinutes(row, "sleep_duration_minutes", minutes);
+
+              const stage = d.value;
+              // 0 = awake, 1 = asleep, 2 = core, 3 = deep, 4 = rem
+              if (stage === 3 || String(stage) === "Deep") addMinutes(row, "sleep_deep_minutes", minutes);
+              else if (stage === 4 || String(stage) === "REM") addMinutes(row, "sleep_rem_minutes", minutes);
+              else if (stage === 2 || stage === 1) addMinutes(row, "sleep_core_minutes", minutes);
+              else if (stage === 0) addMinutes(row, "sleep_awake_minutes", minutes);
+            }
           }
         }
       }
     }
 
-    // ---------- Build rows & type-sanitize ----------
+    // ---------- Build rows & sanitize ----------
     let rows = Object.values(summary);
 
     if (rows.length === 0) {
-      console.warn(
-        "[/api/health-data] No valid summary rows generated."
-      );
+      console.warn("[/api/health-data] No valid summary rows generated.");
       return res.json({ message: "No valid data to insert" });
     }
 
-    // Steps / calories integer করে নিচ্ছি (Supabase integer column এর জন্য safe)
+    // integer-safe fields
     rows = rows.map((r) => ({
       ...r,
       steps: Math.round(r.steps || 0),
       active_calories: Math.round(r.active_calories || 0),
       basal_calories: Math.round(r.basal_calories || 0),
+
+      sleep_duration_minutes: Math.round(r.sleep_duration_minutes || 0),
+      sleep_deep_minutes: Math.round(r.sleep_deep_minutes || 0),
+      sleep_rem_minutes: Math.round(r.sleep_rem_minutes || 0),
+      sleep_core_minutes: Math.round(r.sleep_core_minutes || 0),
+      sleep_awake_minutes: Math.round(r.sleep_awake_minutes || 0),
     }));
 
-    console.log(
-      "[/api/health-data] Prepared summary rows for dates:",
-      rows.map((r) => r.date)
-    );
-    console.log(
-      "[/api/health-data] Example row:",
-      JSON.stringify(rows[0], null, 2)
-    );
+    console.log("[/api/health-data] Prepared summary rows for dates:", rows.map((r) => r.date));
+    console.log("[/api/health-data] Example row:", JSON.stringify(rows[0], null, 2));
 
     // ---------- Upsert into Supabase ----------
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from("daily_health_summary")
       .upsert(rows, { onConflict: "user_id,date" }); // UNIQUE(user_id,date)
 
@@ -301,12 +310,7 @@ app.post("/api/health-data", async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
-    console.log(
-      "[/api/health-data] Upsert success. user_id:",
-      userId,
-      "rows:",
-      rows.length
-    );
+    console.log("[/api/health-data] Upsert success. user_id:", userId, "rows:", rows.length);
 
     return res.json({
       message: "Success",
@@ -314,20 +318,25 @@ app.post("/api/health-data", async (req, res) => {
       dates: rows.map((r) => r.date).sort(),
     });
   } catch (err) {
-    console.error(
-      "[/api/health-data] Unexpected error while processing payload:",
-      err
-    );
-    return res.status(500).json({
-      error: "Server error",
-      details: err.message,
-    });
+    console.error("[/api/health-data] Unexpected error while processing payload:", err);
+    return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
-// ---------- Health check endpoint (for Render) ----------
+// ---------- Health check endpoint ----------
 app.get("/", (req, res) => {
   res.send("THOR Health API is running.");
+});
+
+// ---------- 404 handler ----------
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+
+// ---------- Error handler ----------
+app.use((err, req, res, next) => {
+  console.error("[server] Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
 });
 
 // ---------- Start server (Render uses PORT env) ----------
@@ -336,5 +345,5 @@ const server = app.listen(PORT, () => {
   console.log(`THOR Health API listening on port ${PORT}`);
 });
 
-// Render মাঝে মাঝে long request-এ timeout খায়, একটু বাড়িয়ে দিলাম
+// Increase server timeout
 server.setTimeout(180000); // 3 minutes
