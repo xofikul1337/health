@@ -24,10 +24,10 @@ app.set("trust proxy", 1);
 // ---------- Readiness Routes (plug-in) ----------
 const readinessRoutes = require("./api/readinessRoutes");
 app.use("/api/readiness", readinessRoutes);
-
-// ---------- Weekly Report Routes (plug-in) ----------
+// ---------- Weekly Rotues ----------
 const weeklyReportRoutes = require("./api/weeklyReportRoutes");
 app.use("/api/weekly-report", weeklyReportRoutes);
+
 
 // ---------- Health Auto Export Webhook ----------
 app.post("/api/health-data", async (req, res) => {
