@@ -5,130 +5,119 @@ const { buildWeeklyReport } = require("./weeklyReportCalc");
 
 const router = express.Router();
 
-/**
- * Fetch daily rows for a user within a date window.
- * We fetch a wider window (last 30 days) so both last7 and prev7 are available.
- */
-async function fetchDailyRows(uid, endDateStr) {
-  // If endDateStr provided -> use it; else DB latest date will be discovered by calc,
-  // but to be safe we still pull the last ~30 days.
-  // We can query by date >= (endDate - 29) when endDate is provided.
-  let fromDate = null;
+function yyyyMmDd(d) {
+  // Return UTC date "YYYY-MM-DD"
+  const iso = new Date(d).toISOString();
+  return iso.slice(0, 10);
+}
 
-  if (endDateStr) {
-    const end = new Date(`${endDateStr}T00:00:00Z`);
-    if (!Number.isNaN(end.getTime())) {
-      const from = new Date(end.getTime() - 29 * 24 * 60 * 60 * 1000);
-      fromDate = from.toISOString().slice(0, 10);
-    }
-  }
+function addDays(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return yyyyMmDd(d);
+}
 
-  let q = supabase
+async function fetchDailyRows(userId, startDate, endDate) {
+  const { data, error } = await supabase
     .from("daily_health_summary")
     .select(
-      "date, sleep_duration_minutes, sleep_deep_minutes, sleep_rem_minutes, sleep_core_minutes, sleep_awake_minutes, hrv, resting_hr, steps, active_calories"
+      "date, sleep_duration_minutes, hrv, resting_hr, steps, active_calories"
     )
-    .eq("user_id", uid)
+    .eq("user_id", userId)
+    .gte("date", startDate)
+    .lte("date", endDate)
     .order("date", { ascending: true });
 
-  if (fromDate) q = q.gte("date", fromDate);
-
-  const { data, error } = await q;
-  if (error) throw error;
+  if (error) throw new Error(error.message);
   return data || [];
 }
 
-/**
- * GET /api/weekly-report?uid=...&end=YYYY-MM-DD
- * Returns computed weekly report (does NOT save).
- */
-router.get("/", async (req, res) => {
+// -------------------- GET latest report (UI) --------------------
+router.get("/latest", async (req, res) => {
   try {
-    const uid = req.query.uid;
-    const end = req.query.end; // optional
-    const sleepGoal = req.query.sleep_goal_minutes; // optional
+    const userId = req.query.uid;
+    if (!userId) return res.status(400).json({ error: "Missing uid" });
 
-    if (!uid) return res.status(400).json({ error: "Missing uid" });
+    const { data, error } = await supabase
+      .from("weekly_reports")
+      .select("*")
+      .eq("user_id", userId)
+      .order("generated_at", { ascending: false })
+      .limit(1);
 
-    const rows = await fetchDailyRows(uid, end);
+    if (error) return res.status(500).json({ error: error.message });
 
-    const report = buildWeeklyReport(rows, {
-      endDate: end,
-      sleepGoalMinutes: sleepGoal ? Number(sleepGoal) : 450,
-    });
-
-    return res.json({ weekly_report: report });
+    const report = data?.[0] || null;
+    return res.json({ report });
   } catch (err) {
-    console.error("[weekly-report] GET error:", err);
     return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
-/**
- * POST /api/weekly-report
- * Body: { uid, end?: "YYYY-MM-DD", sleep_goal_minutes?: number, save?: boolean }
- *
- * If save=true -> upsert into weekly_reports table.
- * Otherwise just returns report.
- */
-router.post("/", async (req, res) => {
+// -------------------- GET reports list (UI optional) --------------------
+router.get("/", async (req, res) => {
   try {
-    const { uid, end, sleep_goal_minutes, save } = req.body || {};
-    if (!uid) return res.status(400).json({ error: "Missing uid" });
+    const userId = req.query.uid;
+    const limit = Math.min(Number(req.query.limit || 10), 52);
 
-    const rows = await fetchDailyRows(uid, end);
+    if (!userId) return res.status(400).json({ error: "Missing uid" });
 
-    const report = buildWeeklyReport(rows, {
-      endDate: end,
-      sleepGoalMinutes: sleep_goal_minutes ? Number(sleep_goal_minutes) : 450,
+    const { data, error } = await supabase
+      .from("weekly_reports")
+      .select("*")
+      .eq("user_id", userId)
+      .order("generated_at", { ascending: false })
+      .limit(limit);
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    return res.json({ reports: data || [] });
+  } catch (err) {
+    return res.status(500).json({ error: "Server error", details: err.message });
+  }
+});
+
+// -------------------- POST generate report (cron/Postman trigger) --------------------
+router.post("/generate", async (req, res) => {
+  try {
+    const userId = req.query.uid || req.body?.uid;
+    if (!userId) return res.status(400).json({ error: "Missing uid" });
+
+    // anchor end date: default today (UTC)
+    const end = req.query.end || req.body?.end || yyyyMmDd(new Date());
+    const weekEnd = end;
+    const weekStart = addDays(weekEnd, -6);
+
+    const prevEnd = addDays(weekStart, -1);
+    const prevStart = addDays(prevEnd, -6);
+
+    // fetch daily rows
+    const [last7Rows, prev7Rows] = await Promise.all([
+      fetchDailyRows(userId, weekStart, weekEnd),
+      fetchDailyRows(userId, prevStart, prevEnd),
+    ]);
+
+    // build report (pure)
+    const report = buildWeeklyReport({
+      userId,
+      weekStart,
+      weekEnd,
+      last7Rows,
+      prev7Rows,
+      sleepGoalMinutes: 450,
     });
 
-    if (!save) {
-      return res.json({ weekly_report: report });
-    }
-
-    // ✅ Optional saving
-    // Suggested weekly_reports schema (if you want persistence):
-    // - user_id uuid
-    // - week_end date
-    // - week_start date
-    // - status text
-    // - summary text
-    // - trends jsonb
-    // - action_items jsonb
-    // - stats jsonb
-    // - missing jsonb
-    // UNIQUE(user_id, week_end)
-
-    if (!report?.period?.end) {
-      return res.status(400).json({ error: "Cannot save: report has no period.end" });
-    }
-
-    const payloadToSave = {
-      user_id: uid,
-      week_end: report.period.end,
-      week_start: report.period.start,
-      status: report.status,
-      summary: report.summary,
-      trends: report.trends,
-      action_items: report.action_items,
-      stats: report.stats,
-      missing: report.missing,
-      updated_at: new Date().toISOString(),
-    };
-
-    const { error } = await supabase
+    // store into weekly_reports (upsert by user_id + week range)
+    const { data, error } = await supabase
       .from("weekly_reports")
-      .upsert(payloadToSave, { onConflict: "user_id,week_end" });
+      .upsert(report, { onConflict: "user_id,week_start,week_end" })
+      .select("*")
+      .single();
 
-    if (error) {
-      console.error("[weekly-report] Save error:", error);
-      return res.status(500).json({ error: error.message });
-    }
+    if (error) return res.status(500).json({ error: error.message });
 
-    return res.json({ weekly_report: report, saved: true });
+    return res.json({ report: data });
   } catch (err) {
-    console.error("[weekly-report] POST error:", err);
     return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
