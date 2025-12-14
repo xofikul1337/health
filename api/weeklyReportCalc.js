@@ -1,229 +1,147 @@
 // api/weeklyReportCalc.js
-// Pure aggregation + text template (no DB, no Express)
+// Pure calculation: takes daily rows and returns a weekly report object.
 
-function parseDateYYYYMMDD(s) {
-  if (!s) return null;
-  // daily_health_summary.date is likely "YYYY-MM-DD"
-  const d = new Date(`${String(s).slice(0, 10)}T00:00:00Z`);
-  return Number.isNaN(d.getTime()) ? null : d;
+function safeNumber(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
 }
 
-function fmtHhMmFromMinutes(min) {
-  const m = Math.max(0, Math.round(Number(min) || 0));
+function avg(values) {
+  const nums = values.map(safeNumber).filter((v) => v !== null);
+  if (!nums.length) return null;
+  const sum = nums.reduce((a, b) => a + b, 0);
+  return sum / nums.length;
+}
+
+function round(n, digits = 0) {
+  if (!Number.isFinite(n)) return null;
+  const p = Math.pow(10, digits);
+  return Math.round(n * p) / p;
+}
+
+function minutesToHM(min) {
+  const m = Math.max(0, Math.round(min || 0));
   const h = Math.floor(m / 60);
   const mm = m % 60;
   return `${h}h ${String(mm).padStart(2, "0")}m`;
 }
 
-function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
-}
-
-function round1(n) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return null;
-  return Math.round(x * 10) / 10;
-}
-
-function avg(nums) {
-  const arr = (nums || []).map(Number).filter((x) => Number.isFinite(x));
-  if (arr.length === 0) return null;
-  return arr.reduce((s, v) => s + v, 0) / arr.length;
-}
-
-function sum(nums) {
-  const arr = (nums || []).map(Number).filter((x) => Number.isFinite(x));
-  return arr.reduce((s, v) => s + v, 0);
-}
-
 function pctChange(current, previous) {
-  const c = Number(current);
-  const p = Number(previous);
-  if (!Number.isFinite(c) || !Number.isFinite(p) || p === 0) return null;
+  const c = safeNumber(current);
+  const p = safeNumber(previous);
+  if (c === null || p === null || p === 0) return null;
   return ((c - p) / p) * 100;
 }
 
-/**
- * Build weekly report from daily rows (from daily_health_summary).
- *
- * rows fields used:
- * - date (YYYY-MM-DD)
- * - sleep_duration_minutes (int)
- * - hrv (float ms)
- * - resting_hr (float bpm)
- * - steps (int)
- * - active_calories (int)
- *
- * Options:
- * - endDate: "YYYY-MM-DD" (optional). If missing, uses max(date) from rows.
- * - sleepGoalMinutes: default 450 (7h30m)
- */
-function buildWeeklyReport(rows, options = {}) {
-  const sleepGoalMinutes = Number(options.sleepGoalMinutes || 450);
+// Build a short “stable / improving” style text.
+function trendTextHRV(pct) {
+  if (pct === null) return "HRV awaiting sync.";
+  if (pct > 5) return `HRV up by ${Math.round(pct)}%`;
+  if (pct < -5) return `HRV down by ${Math.abs(Math.round(pct))}%`;
+  return "HRV stable";
+}
 
-  const cleaned = (rows || [])
-    .map((r) => ({
-      ...r,
-      _d: parseDateYYYYMMDD(r.date),
-    }))
-    .filter((r) => r._d);
+function trendTextRHR(deltaBpm) {
+  if (deltaBpm === null) return "Resting HR awaiting sync.";
+  if (deltaBpm <= -2) return `Resting HR down by ${Math.abs(Math.round(deltaBpm))} bpm`;
+  if (deltaBpm >= 2) return `Resting HR up by ${Math.round(deltaBpm)} bpm`;
+  return "Resting HR stable";
+}
 
-  if (cleaned.length === 0) {
-    return {
-      status: "awaiting_sync",
-      message: "No data found for this user yet.",
-      period: null,
-      summary: "Awaiting sync",
-      trends: [],
-      action_items: ["Sync your Apple Health data to generate a weekly report."],
-      stats: {},
-      missing: ["sleep", "hrv", "resting_hr"],
-    };
-  }
+// Main function
+function buildWeeklyReport({
+  userId,
+  weekStart, // "YYYY-MM-DD"
+  weekEnd,   // "YYYY-MM-DD"
+  last7Rows = [],
+  prev7Rows = [],
+  sleepGoalMinutes = 450, // 7h30m
+}) {
+  // last7 averages
+  const lastSleepAvg = avg(last7Rows.map((r) => r.sleep_duration_minutes));
+  const lastHrvAvg = avg(last7Rows.map((r) => r.hrv));
+  const lastRhrAvg = avg(last7Rows.map((r) => r.resting_hr));
 
-  // Determine end date: prefer explicit, else latest date in DB.
-  let end = options.endDate ? parseDateYYYYMMDD(options.endDate) : null;
-  if (!end) {
-    end = cleaned.reduce((mx, r) => (r._d > mx ? r._d : mx), cleaned[0]._d);
-  }
+  // prev7 averages
+  const prevHrvAvg = avg(prev7Rows.map((r) => r.hrv));
+  const prevRhrAvg = avg(prev7Rows.map((r) => r.resting_hr));
 
-  const dayMs = 24 * 60 * 60 * 1000;
-  const start7 = new Date(end.getTime() - 6 * dayMs);
-  const startPrev7 = new Date(end.getTime() - 13 * dayMs);
-  const endPrev7 = new Date(end.getTime() - 7 * dayMs);
-
-  const inRange = (d, a, b) => d >= a && d <= b;
-
-  const last7 = cleaned.filter((r) => inRange(r._d, start7, end));
-  const prev7 = cleaned.filter((r) => inRange(r._d, startPrev7, endPrev7));
-
-  // Helpers to pick available values (ignore null)
-  const pick = (arr, key) =>
-    arr
-      .map((r) => r[key])
-      .map(Number)
-      .filter((x) => Number.isFinite(x) && x !== 0);
-
-  // Sleep averages (minutes)
-  const avgSleepLast7 = avg(
-    last7
-      .map((r) => Number(r.sleep_duration_minutes))
-      .filter((x) => Number.isFinite(x) && x > 0)
-  );
-
-  const avgSleepPrev7 = avg(
-    prev7
-      .map((r) => Number(r.sleep_duration_minutes))
-      .filter((x) => Number.isFinite(x) && x > 0)
-  );
-
-  // HRV (ms)
-  const avgHrvLast7 = avg(pick(last7, "hrv"));
-  const avgHrvPrev7 = avg(pick(prev7, "hrv"));
-
-  // Resting HR (bpm)
-  const avgRhrLast7 = avg(pick(last7, "resting_hr"));
-  const avgRhrPrev7 = avg(pick(prev7, "resting_hr"));
-
-  // Activity (optional in text)
-  const sumStepsLast7 = sum(
-    last7.map((r) => Number(r.steps)).filter((x) => Number.isFinite(x) && x >= 0)
-  );
-  const sumActiveCalLast7 = sum(
-    last7
-      .map((r) => Number(r.active_calories))
-      .filter((x) => Number.isFinite(x) && x >= 0)
-  );
-
-  const hrvDeltaPct = pctChange(avgHrvLast7, avgHrvPrev7);
-  const rhrDelta = Number.isFinite(avgRhrLast7) && Number.isFinite(avgRhrPrev7)
-    ? avgRhrLast7 - avgRhrPrev7
+  const hrvPct = pctChange(lastHrvAvg, prevHrvAvg);
+  const rhrDelta = (safeNumber(lastRhrAvg) !== null && safeNumber(prevRhrAvg) !== null)
+    ? (lastRhrAvg - prevRhrAvg)
     : null;
 
-  // Missing detection
-  const missing = [];
-  if (!Number.isFinite(avgSleepLast7)) missing.push("sleep");
-  if (!Number.isFinite(avgHrvLast7)) missing.push("hrv");
-  if (!Number.isFinite(avgRhrLast7)) missing.push("resting_hr");
+  // Summary sentence (like your UI)
+  const hrvLine = trendTextHRV(hrvPct);
+  const rhrLine = trendTextRHR(rhrDelta);
 
-  // Build narrative pieces
+  let sleepLine = "Sleep duration awaiting sync.";
+  if (lastSleepAvg !== null) {
+    if (lastSleepAvg + 1 < sleepGoalMinutes) sleepLine = "Sleep duration slightly below target.";
+    else sleepLine = "Sleep duration on target.";
+  }
+
+  const summary = `${hrvLine}, ${rhrLine.toLowerCase()}. ${sleepLine}`;
+
+  // Trends block (UI)
   const trends = [];
-  const action_items = [];
-
-  if (Number.isFinite(avgSleepLast7)) {
-    trends.push(`Average sleep: ${fmtHhMmFromMinutes(avgSleepLast7)} (goal ${fmtHhMmFromMinutes(sleepGoalMinutes)})`);
-    if (avgSleepLast7 + 1 < sleepGoalMinutes) {
-      action_items.push("Add 30 minutes earlier bedtime");
-    }
+  if (lastSleepAvg !== null) {
+    trends.push(`Average sleep: ${minutesToHM(lastSleepAvg)} (goal ${minutesToHM(sleepGoalMinutes)})`);
   } else {
     trends.push("Average sleep: Awaiting sync");
   }
 
-  if (Number.isFinite(hrvDeltaPct)) {
-    const sign = hrvDeltaPct >= 0 ? "up" : "down";
-    trends.push(`HRV ${sign} by ${Math.abs(Math.round(hrvDeltaPct))}%`);
-    if (hrvDeltaPct < -5) action_items.push("Plan one extra low-intensity / recovery day this week");
-  } else {
-    trends.push("HRV: Awaiting sync");
+  if (hrvPct !== null) trends.push(`${trendTextHRV(hrvPct)}`);
+  else trends.push("HRV: Awaiting sync");
+
+  if (rhrDelta !== null) trends.push(`${trendTextRHR(rhrDelta)}`);
+  else trends.push("Resting HR: Awaiting sync");
+
+  // Action items (simple rules)
+  const actionItems = [];
+
+  if (lastSleepAvg !== null && lastSleepAvg + 1 < sleepGoalMinutes) {
+    const deficit = Math.max(10, Math.round((sleepGoalMinutes - lastSleepAvg)));
+    // nice-looking “30 minutes earlier bedtime” suggestion
+    const suggest = deficit >= 30 ? 30 : 15;
+    actionItems.push(`Add ${suggest} minutes earlier bedtime`);
   }
 
-  if (Number.isFinite(rhrDelta)) {
-    const sign = rhrDelta <= 0 ? "down" : "up";
-    trends.push(`Resting HR ${sign} by ${Math.abs(Math.round(rhrDelta * 10) / 10)} bpm`);
-    if (rhrDelta > 2) action_items.push("Reduce intensity 1 day; prioritize sleep + hydration");
-  } else {
-    trends.push("Resting HR: Awaiting sync");
+  // if HRV down or RHR up => suggest extra easy day
+  const hrvDown = hrvPct !== null && hrvPct < -5;
+  const rhrUp = rhrDelta !== null && rhrDelta > 1.5;
+  if (hrvDown || rhrUp) {
+    actionItems.push("One extra rest/low-intensity day mid-week");
   }
 
-  // Simple extra action item based on load (optional)
-  if (sumStepsLast7 > 70000 || sumActiveCalLast7 > 3500) {
-    // high load week
-    action_items.push("One extra rest/low-intensity day mid-week");
+  if (!actionItems.length) {
+    actionItems.push("Keep routines consistent—sleep and recovery look stable.");
   }
-
-  // Summary sentence (short like UI)
-  let summary = "Weekly report generated.";
-  if (Number.isFinite(hrvDeltaPct) && Number.isFinite(rhrDelta)) {
-    const hrvWord = hrvDeltaPct >= 0 ? "stable/improving" : "dropping";
-    const rhrWord = rhrDelta <= 0 ? "improving" : "rising";
-    summary = `HRV ${hrvWord}, resting HR ${rhrWord}.`;
-  } else if (missing.length > 0) {
-    summary = "Partial data synced. Some metrics are missing.";
-  }
-
-  // Always keep action items short, unique, max 3
-  const uniq = [...new Set(action_items)].slice(0, 3);
-  if (uniq.length === 0) {
-    uniq.push("Keep consistency: sleep, hydration, and steady training load.");
-  }
-
-  const period = {
-    start: start7.toISOString().slice(0, 10),
-    end: end.toISOString().slice(0, 10),
-    days_included: last7.length,
-  };
 
   return {
-    status: missing.length >= 2 ? "partial" : "ok",
-    message: "Success",
-    period,
+    user_id: userId,
+    week_start: weekStart,
+    week_end: weekEnd,
+    title: "Last 7 days",
     summary,
+
+    avg_sleep_minutes: lastSleepAvg !== null ? Math.round(lastSleepAvg) : null,
+    sleep_goal_minutes: sleepGoalMinutes,
+
+    avg_hrv_ms: lastHrvAvg !== null ? round(lastHrvAvg, 1) : null,
+    hrv_change_pct: hrvPct !== null ? round(hrvPct, 1) : null,
+
+    avg_resting_hr_bpm: lastRhrAvg !== null ? round(lastRhrAvg, 1) : null,
+    resting_hr_change_bpm: rhrDelta !== null ? round(rhrDelta, 1) : null,
+
     trends,
-    action_items: uniq,
-    stats: {
-      avg_sleep_minutes_last7: Number.isFinite(avgSleepLast7) ? Math.round(avgSleepLast7) : null,
-      sleep_goal_minutes: sleepGoalMinutes,
-      avg_hrv_ms_last7: round1(avgHrvLast7),
-      hrv_change_pct: round1(hrvDeltaPct),
-      avg_resting_hr_bpm_last7: round1(avgRhrLast7),
-      resting_hr_change_bpm: round1(rhrDelta),
-      steps_total_last7: Math.round(sumStepsLast7),
-      active_calories_total_last7: Math.round(sumActiveCalLast7),
+    action_items: actionItems,
+
+    meta: {
+      last7_days_count: last7Rows.length,
+      prev7_days_count: prev7Rows.length,
     },
-    missing,
   };
 }
 
-module.exports = {
-  buildWeeklyReport,
-};
+module.exports = { buildWeeklyReport };
