@@ -219,56 +219,63 @@ app.post("/api/health-data", async (req, res) => {
           row.diastolic = Number(value);
         }
 
-        // 10) Sleep ( FIXED: supports BOTH formats)
-        if (name.includes("sleep_analysis")) {
-          // (A) hr summary object format
-          // Example: { totalSleep: 5.9, deep: 0.88, rem: 1.25, core: 3.77, awake: 0.06, ... }
-          const hasHrSummary =
-            d.totalSleep != null ||
-            d.deep != null ||
-            d.rem != null ||
-            d.core != null ||
-            d.awake != null;
+        // 10) Sleep (duration + stages)
+if (name.includes("sleep_analysis")) {
+  // ✅ bucket day should follow END of sleep segment (or summary "date" if present)
+  const sleepBucketDateStr =
+    d.date || d.end || d.endDate || d.start || d.startDate;
 
-          if (hasHrSummary) {
-            // totalSleep is "asleep time" in hours
-            const totalMin = hrToMin(d.totalSleep);
-            const deepMin = hrToMin(d.deep);
-            const remMin = hrToMin(d.rem);
-            const coreMin = hrToMin(d.core);
-            const awakeMin = hrToMin(d.awake);
+  const sleepRow = ensureDay(sleepBucketDateStr);
+  if (!sleepRow) continue;
 
-            // We treat duration as "totalSleep" minutes (not inBed)
-            addMinutes(row, "sleep_duration_minutes", totalMin);
+  // (A) Summary-object format (units: "hr") => totalSleep/deep/rem/core/awake
+  // Example: { totalSleep: 5.9, deep: 0.8, rem: 1.2, core: 3.7, awake: 0.06, date: "..." }
+  const hasSummaryHours =
+    typeof d.totalSleep === "number" ||
+    typeof d.deep === "number" ||
+    typeof d.rem === "number" ||
+    typeof d.core === "number" ||
+    typeof d.awake === "number";
 
-            // Stages
-            addMinutes(row, "sleep_deep_minutes", deepMin);
-            addMinutes(row, "sleep_rem_minutes", remMin);
-            addMinutes(row, "sleep_core_minutes", coreMin);
-            addMinutes(row, "sleep_awake_minutes", awakeMin);
+  if (hasSummaryHours) {
+    const totalMin = Math.round((Number(d.totalSleep) || 0) * 60);
+    const deepMin  = Math.round((Number(d.deep) || 0) * 60);
+    const remMin   = Math.round((Number(d.rem) || 0) * 60);
+    const coreMin  = Math.round((Number(d.core) || 0) * 60);
+    const awakeMin = Math.round((Number(d.awake) || 0) * 60);
 
-            continue; //  done for this datapoint
-          }
+    // overwrite or max—আমি overwrite দিচ্ছি কারণ summary সাধারণত “সেই দিনের মোট”
+    sleepRow.sleep_duration_minutes = totalMin;
+    sleepRow.sleep_deep_minutes = deepMin;
+    sleepRow.sleep_rem_minutes = remMin;
+    sleepRow.sleep_core_minutes = coreMin;
+    sleepRow.sleep_awake_minutes = awakeMin;
 
-          // (B) start/end segments format (older approach)
-          const start = new Date(d.start || d.startDate);
-          const end = new Date(d.end || d.endDate);
-          if (!isNaN(start) && !isNaN(end)) {
-            const minutes = (end - start) / 60000;
-            if (Number.isFinite(minutes) && minutes > 0) {
-              addMinutes(row, "sleep_duration_minutes", minutes);
+    continue; // summary handled
+  }
 
-              const stage = d.value;
-              // 0 = awake, 1 = asleep, 2 = core, 3 = deep, 4 = rem
-              if (stage === 3 || String(stage) === "Deep") addMinutes(row, "sleep_deep_minutes", minutes);
-              else if (stage === 4 || String(stage) === "REM") addMinutes(row, "sleep_rem_minutes", minutes);
-              else if (stage === 2 || stage === 1) addMinutes(row, "sleep_core_minutes", minutes);
-              else if (stage === 0) addMinutes(row, "sleep_awake_minutes", minutes);
-            }
-          }
-        }
-      }
-    }
+  // (B) ✅ Segment format with start/end + stage value (units: "min")
+  const start = new Date(d.start || d.startDate);
+  const end = new Date(d.end || d.endDate);
+  if (isNaN(start) || isNaN(end)) continue;
+
+  const minutes = (end - start) / 60000;
+  if (!Number.isFinite(minutes) || minutes <= 0) continue;
+
+  sleepRow.sleep_duration_minutes += minutes;
+
+  const stage = d.value;
+  // 0 = awake, 1 = asleep, 2 = core, 3 = deep, 4 = rem
+  if (stage === 0 || String(stage).toLowerCase() === "awake") {
+    sleepRow.sleep_awake_minutes += minutes;
+  } else if (stage === 3 || String(stage) === "Deep") {
+    sleepRow.sleep_deep_minutes += minutes;
+  } else if (stage === 4 || String(stage) === "REM") {
+    sleepRow.sleep_rem_minutes += minutes;
+  } else if (stage === 2 || stage === 1) {
+    sleepRow.sleep_core_minutes += minutes;
+  }
+}
 
     // ---------- Build rows & sanitize ----------
     let rows = Object.values(summary);
