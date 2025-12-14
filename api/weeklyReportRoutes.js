@@ -1,122 +1,165 @@
 // api/weeklyReportRoutes.js
 const express = require("express");
-const { supabase } = require("./supabaseClient");
-const { weeklyReportCalc } = require("./weeklyReportCalc");
-
 const router = express.Router();
 
-function isoDate(d) {
-  // returns YYYY-MM-DD
-  return new Date(d).toISOString().slice(0, 10);
+const { supabase } = require("./supabaseClient");
+const { buildWeeklyReport, isValidYmd, addDaysUTC } = require("./weeklyReportCalc");
+
+// basic UUID check
+function isUuid(v) {
+  return typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
 }
 
-function addDays(dateStr, days) {
-  const d = new Date(`${dateStr}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return isoDate(d);
+// Fetch daily rows from daily_health_summary for a date range [start, end]
+async function fetchDailyRange(uid, start, end) {
+  const { data, error } = await supabase
+    .from("daily_health_summary")
+    .select(
+      [
+        "date",
+        "sleep_duration_minutes",
+        "sleep_deep_minutes",
+        "sleep_rem_minutes",
+        "sleep_core_minutes",
+        "sleep_awake_minutes",
+        "hrv",
+        "resting_hr",
+        "steps",
+        "active_calories",
+      ].join(",")
+    )
+    .eq("user_id", uid)
+    .gte("date", start)
+    .lte("date", end)
+    .order("date", { ascending: true });
+
+  if (error) throw new Error(error.message);
+  return data || [];
 }
-
-/**
- * GET /api/weekly-report/last7?uid=...&end=YYYY-MM-DD&goalSleepMinutes=450
- * - end optional: default = today (UTC)
- * - fetches 14 days ending at end (inclusive): prev7 + last7
- * - returns summary/trends/action items
- */
-router.get("/last7", async (req, res) => {
-  try {
-    const uid = req.query.uid;
-    if (!uid) return res.status(400).json({ error: "Missing uid" });
-
-    const end = req.query.end ? String(req.query.end) : isoDate(new Date());
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(end)) {
-      return res.status(400).json({ error: "Invalid end date. Use YYYY-MM-DD" });
-    }
-
-    const goalSleepMinutes = req.query.goalSleepMinutes
-      ? Number(req.query.goalSleepMinutes)
-      : 450;
-
-    // We want 14 days: [end-13 .. end]
-    const start = addDays(end, -13);
-
-    const { data, error } = await supabase
-      .from("daily_health_summary")
-      .select(
-        "date,sleep_duration_minutes,resting_hr,hrv,steps,active_calories,basal_calories,sleep_deep_minutes,sleep_rem_minutes,sleep_core_minutes,sleep_awake_minutes"
-      )
-      .eq("user_id", uid)
-      .gte("date", start)
-      .lte("date", end)
-      .order("date", { ascending: true });
-
-    if (error) return res.status(500).json({ error: error.message });
-
-    const report = weeklyReportCalc(data || [], { goalSleepMinutes });
-
-    return res.json({
-      weekly_report: {
-        uid,
-        start_date: start,
-        end_date: end,
-        ...report,
-      },
-    });
-  } catch (e) {
-    console.error("[weekly-report] error:", e);
-    return res.status(500).json({ error: "Server error", details: e.message });
-  }
-});
 
 /**
  * POST /api/weekly-report/generate
- * body: { uid, end?: YYYY-MM-DD, goalSleepMinutes?: number }
- * - generates report and (optionally) saves to weekly_reports table if you create it later
- * For now, it just returns the same payload. You can enable DB insert later.
+ * Body: { uid, end?: "YYYY-MM-DD", goalSleepMinutes?: 450 }
+ * - Computes rolling 7-day report ending "end" (default: today UTC)
+ * - Upserts into weekly_reports by (user_id, week_end)
  */
 router.post("/generate", async (req, res) => {
   try {
     const uid = req.body?.uid;
-    if (!uid) return res.status(400).json({ error: "Missing uid" });
+    const end = req.body?.end; // optional
+    const goalSleepMinutes = Number(req.body?.goalSleepMinutes ?? 450);
 
-    const end = req.body?.end ? String(req.body.end) : isoDate(new Date());
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(end)) {
-      return res.status(400).json({ error: "Invalid end date. Use YYYY-MM-DD" });
+    if (!isUuid(uid)) return res.status(400).json({ error: "Invalid uid" });
+
+    let weekEnd = end;
+    if (!weekEnd) {
+      // default today (UTC date)
+      const now = new Date();
+      weekEnd = now.toISOString().slice(0, 10);
     }
+    if (!isValidYmd(weekEnd)) return res.status(400).json({ error: "Invalid end (YYYY-MM-DD)" });
 
-    const goalSleepMinutes = req.body?.goalSleepMinutes
-      ? Number(req.body.goalSleepMinutes)
-      : 450;
+    const weekStart = addDaysUTC(weekEnd, -6);
 
-    const start = addDays(end, -13);
+    // previous window for trends
+    const prevEnd = addDaysUTC(weekStart, -1);
+    const prevStart = addDaysUTC(prevEnd, -6);
+
+    const [dailyRows, prevDailyRows] = await Promise.all([
+      fetchDailyRange(uid, weekStart, weekEnd),
+      fetchDailyRange(uid, prevStart, prevEnd),
+    ]);
+
+    const reportRow = buildWeeklyReport({
+      uid,
+      end: weekEnd,
+      goalSleepMinutes,
+      dailyRows,
+      prevDailyRows,
+    });
 
     const { data, error } = await supabase
-      .from("daily_health_summary")
-      .select(
-        "date,sleep_duration_minutes,resting_hr,hrv,steps,active_calories,basal_calories,sleep_deep_minutes,sleep_rem_minutes,sleep_core_minutes,sleep_awake_minutes"
-      )
-      .eq("user_id", uid)
-      .gte("date", start)
-      .lte("date", end)
-      .order("date", { ascending: true });
+      .from("weekly_reports")
+      .upsert(reportRow, { onConflict: "user_id,week_end" })
+      .select()
+      .single();
 
     if (error) return res.status(500).json({ error: error.message });
 
-    const report = weeklyReportCalc(data || [], { goalSleepMinutes });
+    return res.json({ ok: true, weekly_report: data });
+  } catch (err) {
+    console.error("[weekly-report] generate error:", err);
+    return res.status(500).json({ error: "Server error", details: err.message });
+  }
+});
 
-    // Later: save to weekly_reports table here (optional)
-    // await supabase.from("weekly_reports").insert({...})
+/**
+ * GET /api/weekly-report/latest?uid=...
+ * Returns latest saved weekly report for user (from weekly_reports table).
+ */
+router.get("/latest", async (req, res) => {
+  try {
+    const uid = req.query?.uid;
+    if (!isUuid(uid)) return res.status(400).json({ error: "Invalid uid" });
 
-    return res.json({
-      weekly_report: {
-        uid,
-        start_date: start,
-        end_date: end,
-        ...report,
-      },
-    });
-  } catch (e) {
-    console.error("[weekly-report] error:", e);
-    return res.status(500).json({ error: "Server error", details: e.message });
+    const { data, error } = await supabase
+      .from("weekly_reports")
+      .select("*")
+      .eq("user_id", uid)
+      .order("week_end", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    if (!data) {
+      return res.json({
+        weekly_report: null,
+        status: "awaiting_sync",
+        message: "No weekly report saved yet. Run POST /generate (cron) first.",
+      });
+    }
+
+    return res.json({ weekly_report: data });
+  } catch (err) {
+    console.error("[weekly-report] latest error:", err);
+    return res.status(500).json({ error: "Server error", details: err.message });
+  }
+});
+
+/**
+ * GET /api/weekly-report/by-end?uid=...&end=YYYY-MM-DD
+ * Returns saved weekly report for a specific week_end.
+ */
+router.get("/by-end", async (req, res) => {
+  try {
+    const uid = req.query?.uid;
+    const end = req.query?.end;
+
+    if (!isUuid(uid)) return res.status(400).json({ error: "Invalid uid" });
+    if (!isValidYmd(end)) return res.status(400).json({ error: "Invalid end (YYYY-MM-DD)" });
+
+    const { data, error } = await supabase
+      .from("weekly_reports")
+      .select("*")
+      .eq("user_id", uid)
+      .eq("week_end", end)
+      .maybeSingle();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    if (!data) {
+      return res.json({
+        weekly_report: null,
+        status: "not_found",
+        message: "No saved report for that week_end. Run POST /generate for that end date.",
+      });
+    }
+
+    return res.json({ weekly_report: data });
+  } catch (err) {
+    console.error("[weekly-report] by-end error:", err);
+    return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
