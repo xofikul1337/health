@@ -8,6 +8,8 @@ if (!supabaseUrl || !supabaseServiceRoleKey) {
   console.warn("[supabaseClient] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
 }
 
-const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+const supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+  auth: { persistSession: false },
+});
 
-module.exports = supabase;
+module.exports = { supabase };
