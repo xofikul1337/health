@@ -25,6 +25,10 @@ app.set("trust proxy", 1);
 const readinessRoutes = require("./api/readinessRoutes");
 app.use("/api/readiness", readinessRoutes);
 
+// ---------- Weekly Report Routes (plug-in) ----------
+const weeklyReportRoutes = require("./api/weeklyReportRoutes");
+app.use("/api/weekly-report", weeklyReportRoutes);
+
 // ---------- Health Auto Export Webhook ----------
 app.post("/api/health-data", async (req, res) => {
   try {
