@@ -1,7 +1,8 @@
 // api/weeklyReportCalc.js
-// Pure calculation: takes daily rows and returns a weekly report object.
 
 function safeNumber(x) {
+  if (x === null || x === undefined) return null;
+  if (typeof x === "string" && x.trim() === "") return null;
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
 }
@@ -9,13 +10,12 @@ function safeNumber(x) {
 function avg(values) {
   const nums = values.map(safeNumber).filter((v) => v !== null);
   if (!nums.length) return null;
-  const sum = nums.reduce((a, b) => a + b, 0);
-  return sum / nums.length;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
 }
 
 function round(n, digits = 0) {
   if (!Number.isFinite(n)) return null;
-  const p = Math.pow(10, digits);
+  const p = 10 ** digits;
   return Math.round(n * p) / p;
 }
 
@@ -33,96 +33,115 @@ function pctChange(current, previous) {
   return ((c - p) / p) * 100;
 }
 
-// Build a short “stable / improving” style text.
-function trendTextHRV(pct) {
-  if (pct === null) return "HRV awaiting sync.";
-  if (pct > 5) return `HRV up by ${Math.round(pct)}%`;
-  if (pct < -5) return `HRV down by ${Math.abs(Math.round(pct))}%`;
-  return "HRV stable";
-}
-
-function trendTextRHR(deltaBpm) {
-  if (deltaBpm === null) return "Resting HR awaiting sync.";
-  if (deltaBpm <= -2) return `Resting HR down by ${Math.abs(Math.round(deltaBpm))} bpm`;
-  if (deltaBpm >= 2) return `Resting HR up by ${Math.round(deltaBpm)} bpm`;
-  return "Resting HR stable";
-}
-
-// Main function
 function buildWeeklyReport({
   userId,
-  weekStart, // "YYYY-MM-DD"
-  weekEnd,   // "YYYY-MM-DD"
+  weekStart,
+  weekEnd,
   last7Rows = [],
   prev7Rows = [],
-  sleepGoalMinutes = 450, // 7h30m
+  sleepGoalMinutes = 450,
+  minDaysForOk = 4,         // ✅ new-user safe
+  minDaysForCompare = 4,    // ✅ baseline safe
 }) {
-  // last7 averages
+  const syncedDays = last7Rows.length;
+  const prevDays = prev7Rows.length;
+
+  // ---------- Status ----------
+  let status = "ok";
+  if (syncedDays === 0) status = "awaiting_sync";
+  else if (syncedDays < minDaysForOk) status = "partial";
+
+  // ---------- Averages (last 7) ----------
   const lastSleepAvg = avg(last7Rows.map((r) => r.sleep_duration_minutes));
   const lastHrvAvg = avg(last7Rows.map((r) => r.hrv));
   const lastRhrAvg = avg(last7Rows.map((r) => r.resting_hr));
 
-  // prev7 averages
-  const prevHrvAvg = avg(prev7Rows.map((r) => r.hrv));
-  const prevRhrAvg = avg(prev7Rows.map((r) => r.resting_hr));
+  // ---------- Previous averages (prev 7) only if enough ----------
+  const canCompare = prevDays >= minDaysForCompare && syncedDays >= minDaysForCompare;
 
-  const hrvPct = pctChange(lastHrvAvg, prevHrvAvg);
-  const rhrDelta = (safeNumber(lastRhrAvg) !== null && safeNumber(prevRhrAvg) !== null)
-    ? (lastRhrAvg - prevRhrAvg)
-    : null;
+  const prevHrvAvg = canCompare ? avg(prev7Rows.map((r) => r.hrv)) : null;
+  const prevRhrAvg = canCompare ? avg(prev7Rows.map((r) => r.resting_hr)) : null;
 
-  // Summary sentence (like your UI)
-  const hrvLine = trendTextHRV(hrvPct);
-  const rhrLine = trendTextRHR(rhrDelta);
+  const hrvPct = canCompare ? pctChange(lastHrvAvg, prevHrvAvg) : null;
 
-  let sleepLine = "Sleep duration awaiting sync.";
-  if (lastSleepAvg !== null) {
-    if (lastSleepAvg + 1 < sleepGoalMinutes) sleepLine = "Sleep duration slightly below target.";
-    else sleepLine = "Sleep duration on target.";
-  }
+  const lastR = safeNumber(lastRhrAvg);
+  const prevR = safeNumber(prevRhrAvg);
+  const rhrDelta = (canCompare && lastR !== null && prevR !== null) ? (lastR - prevR) : null;
 
-  const summary = `${hrvLine}, ${rhrLine.toLowerCase()}. ${sleepLine}`;
+  // ---------- Trend lines (truthful texts) ----------
+  const hrvLine = (() => {
+    if (safeNumber(lastHrvAvg) === null) return "HRV awaiting sync.";
+    if (!canCompare) return "HRV baseline not available yet";
+    if (hrvPct === null) return "HRV baseline not available yet";
+    if (hrvPct > 5) return `HRV up by ${Math.round(hrvPct)}%`;
+    if (hrvPct < -5) return `HRV down by ${Math.abs(Math.round(hrvPct))}%`;
+    return "HRV stable";
+  })();
 
-  // Trends block (UI)
+  const rhrLine = (() => {
+    if (safeNumber(lastRhrAvg) === null) return "Resting HR awaiting sync.";
+    if (!canCompare) return "Resting HR baseline not available yet";
+    if (rhrDelta === null) return "Resting HR baseline not available yet";
+    if (rhrDelta <= -2) return `Resting HR down by ${Math.abs(Math.round(rhrDelta))} bpm`;
+    if (rhrDelta >= 2) return `Resting HR up by ${Math.round(rhrDelta)} bpm`;
+    return "Resting HR stable";
+  })();
+
+  const sleepLine = (() => {
+    if (lastSleepAvg === null) return "Sleep duration awaiting sync.";
+    if (lastSleepAvg + 1 < sleepGoalMinutes) return "Sleep duration slightly below target.";
+    return "Sleep duration on target.";
+  })();
+
+  // ✅ New user clarity
+  const dataCoverageLine =
+    status === "partial"
+      ? `Only ${syncedDays} of 7 days synced so far. Trends may change as more data arrives.`
+      : null;
+
+  // ---------- Summary ----------
+  const summaryParts = [
+    hrvLine,
+    rhrLine.toLowerCase() + ".",
+    sleepLine,
+  ];
+  if (dataCoverageLine) summaryParts.push(dataCoverageLine);
+
+  const summary = summaryParts.join(" ");
+
+  // ---------- Trends list ----------
   const trends = [];
-  if (lastSleepAvg !== null) {
-    trends.push(`Average sleep: ${minutesToHM(lastSleepAvg)} (goal ${minutesToHM(sleepGoalMinutes)})`);
-  } else {
-    trends.push("Average sleep: Awaiting sync");
-  }
+  trends.push(
+    lastSleepAvg !== null
+      ? `Average sleep: ${minutesToHM(lastSleepAvg)} (goal ${minutesToHM(sleepGoalMinutes)})`
+      : "Average sleep: Awaiting sync"
+  );
+  trends.push(hrvLine);
+  trends.push(rhrLine);
 
-  if (hrvPct !== null) trends.push(`${trendTextHRV(hrvPct)}`);
-  else trends.push("HRV: Awaiting sync");
-
-  if (rhrDelta !== null) trends.push(`${trendTextRHR(rhrDelta)}`);
-  else trends.push("Resting HR: Awaiting sync");
-
-  // Action items (simple rules)
+  // ---------- Action items ----------
   const actionItems = [];
-
   if (lastSleepAvg !== null && lastSleepAvg + 1 < sleepGoalMinutes) {
-    const deficit = Math.max(10, Math.round((sleepGoalMinutes - lastSleepAvg)));
-    // nice-looking “30 minutes earlier bedtime” suggestion
+    const deficit = Math.max(10, Math.round(sleepGoalMinutes - lastSleepAvg));
     const suggest = deficit >= 30 ? 30 : 15;
     actionItems.push(`Add ${suggest} minutes earlier bedtime`);
   }
 
-  // if HRV down or RHR up => suggest extra easy day
-  const hrvDown = hrvPct !== null && hrvPct < -5;
-  const rhrUp = rhrDelta !== null && rhrDelta > 1.5;
-  if (hrvDown || rhrUp) {
+  // ✅ If data is partial, keep action items conservative
+  if (status !== "ok") {
+    actionItems.push("Sync a few more days to unlock reliable weekly trends.");
+  } else {
+    // optional: add training load suggestion if you want
     actionItems.push("One extra rest/low-intensity day mid-week");
   }
 
-  if (!actionItems.length) {
-    actionItems.push("Keep routines consistent—sleep and recovery look stable.");
-  }
-
+  // ---------- Output record ----------
   return {
     user_id: userId,
     week_start: weekStart,
     week_end: weekEnd,
     title: "Last 7 days",
+    status, // ✅ add this column in table (recommended)
     summary,
 
     avg_sleep_minutes: lastSleepAvg !== null ? Math.round(lastSleepAvg) : null,
@@ -138,8 +157,9 @@ function buildWeeklyReport({
     action_items: actionItems,
 
     meta: {
-      last7_days_count: last7Rows.length,
-      prev7_days_count: prev7Rows.length,
+      last7_days_count: syncedDays,
+      prev7_days_count: prevDays,
+      can_compare: canCompare,
     },
   };
 }
