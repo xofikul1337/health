@@ -139,10 +139,10 @@ async function callOpenAI({ messages }) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model,
-      input: messages,
-      temperature: 0.3,
-    }),
+  model,
+  input: messages
+}),
+
   });
 
   if (!res.ok) {
