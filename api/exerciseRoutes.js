@@ -1,34 +1,52 @@
-// api/exercisesRoutes.js
+// api/exerciseRoutes.js
 const express = require("express");
 const supabase = require("./supabaseClient");
 
 const router = express.Router();
 
-// ✅ hard safety limits (crash prevention)
+// Hard safety limits (avoid API crash)
 const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 100;
+const MAX_LIMIT = 50;
+
+// Helper: parse int safely
+function toInt(v, fallback) {
+  const n = Number.parseInt(String(v ?? ""), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// Helper: require uid
+function requireUid(req, res) {
+  const uid = req.query.uid || req.headers["x-user-id"];
+  if (!uid) {
+    res.status(400).json({ error: "Missing uid (user_id). Pass ?uid=... or x-user-id header." });
+    return null;
+  }
+  return String(uid);
+}
 
 /**
  * GET /api/exercises
- * Query params:
- * - q: search keyword (id/name/category/equipment/level/force/mechanic + muscles exact-ish)
- * - page: 1-based page number
- * - limit: page size (max 100)
+ * Query:
+ *  - uid (required)
+ *  - q (optional) -> partial search across text columns
+ *  - muscle (optional) -> exact match in primary_muscles or secondary_muscles
+ *  - category (optional) -> exact/partial category filter
+ *  - page (optional, default 1)
+ *  - limit (optional, default 20, max 50)
  *
- * Examples:
- * /api/exercises?page=1&limit=20
- * /api/exercises?q=sit up
- * /api/exercises?q=abdominals
+ * Returns: { data: [...], meta: { page, limit, total, has_more }, query: {...} }
  */
 router.get("/", async (req, res) => {
   try {
-    const qRaw = (req.query.q || "").toString().trim();
-    const page = Math.max(1, parseInt(req.query.page || "1", 10) || 1);
-    const limit = Math.min(
-      MAX_LIMIT,
-      Math.max(1, parseInt(req.query.limit || String(DEFAULT_LIMIT), 10) || DEFAULT_LIMIT)
-    );
+    const uid = requireUid(req, res);
+    if (!uid) return;
 
+    const qRaw = (req.query.q || "").toString().trim();
+    const muscleRaw = (req.query.muscle || "").toString().trim();
+    const categoryRaw = (req.query.category || "").toString().trim();
+
+    const page = Math.max(1, toInt(req.query.page, 1));
+    const limit = Math.min(MAX_LIMIT, Math.max(1, toInt(req.query.limit, DEFAULT_LIMIT)));
     const from = (page - 1) * limit;
     const to = from + limit - 1;
 
@@ -40,72 +58,90 @@ router.get("/", async (req, res) => {
         { count: "exact" }
       );
 
-    // ---------- Search ----------
-    if (qRaw) {
-      // PostgREST ilike pattern
-      const like = `%${qRaw.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+    // ----- Search (partial) -----
+    // Supabase OR filter: use ilike on text columns
+    if (qRaw.length > 0) {
+      // avoid extremely broad queries (optional safety)
+      // if (qRaw.length < 2) { ... } // (তুমি চাইলে enable করতে পারো)
+      const q = qRaw.replace(/[%_]/g, ""); // basic wildcard sanitization
+      const like = `%${q}%`;
 
-      // 1) Text fields: partial match (2/3 word দিলেও match করবে)
-      // NOTE: arrays (instructions/primary_muscles) এ ilike direct কাজ করে না
-      // তাই muscles-এর জন্য নিচে "contains" based fallback দিচ্ছি।
-      const orParts = [
-        `id.ilike.${like}`,
-        `name.ilike.${like}`,
-        `category.ilike.${like}`,
-        `equipment.ilike.${like}`,
-        `level.ilike.${like}`,
-        `force.ilike.${like}`,
-        `mechanic.ilike.${like}`,
-      ];
-
-      query = query.or(orParts.join(","));
-
-      // 2) Muscles: keyword single-word হলে contains দিয়ে ম্যাচ করার চেষ্টা
-      // "abdominals" / "chest" টাইপ কিওয়ার্ডে ভালো কাজ করবে
-      const firstWord = qRaw.split(/\s+/).filter(Boolean)[0];
-      if (firstWord && firstWord.length >= 2) {
-        // OR এর সাথে muscles contains add করা যায় না একই .or() এ (arrays vs text mixed),
-        // তাই আমরা দুইটা query করি না (performance), বরং filters add করি "optional" ভাবে:
-        // Supabase/PostgREST limitation workaround: muscles matching না হলে তাও text-field match এ রেজাল্ট আসবে।
-        // muscles ONLY search চাইলে তুমি আলাদা param দিতে পারো (future).
-        //
-        // এখানে আমরা extra broaden না করে রাখছি—simple + stable.
-      }
+      // NOTE: PostgREST "or" syntax
+      query = query.or(
+        [
+          `id.ilike.${like}`,
+          `name.ilike.${like}`,
+          `category.ilike.${like}`,
+          `equipment.ilike.${like}`,
+          `level.ilike.${like}`,
+          `force.ilike.${like}`,
+          `mechanic.ilike.${like}`,
+        ].join(",")
+      );
     }
 
-    // ---------- Pagination ----------
+    // ----- Category filter (optional) -----
+    if (categoryRaw.length > 0) {
+      const c = categoryRaw.replace(/[%_]/g, "");
+      query = query.ilike("category", `%${c}%`);
+    }
+
+    // ----- Muscle filter (optional, exact match on arrays) -----
+    // This matches if primary_muscles contains [muscle] OR secondary_muscles contains [muscle]
+    if (muscleRaw.length > 0) {
+      const m = muscleRaw.toLowerCase();
+      query = query.or(
+        [
+          `primary_muscles.cs.{${m}}`,
+          `secondary_muscles.cs.{${m}}`,
+        ].join(",")
+      );
+    }
+
+    // Pagination + ordering
     query = query.order("name", { ascending: true }).range(from, to);
 
     const { data, error, count } = await query;
     if (error) {
-      console.error("[/api/exercises] Supabase error:", error);
-      return res.status(500).json({ error: error.message });
+      console.error("[/api/exercises] supabase error:", error);
+      return res.status(500).json({ error: "DB error", details: error.message });
     }
 
+    const total = count ?? 0;
+    const has_more = from + (data?.length || 0) < total;
+
     return res.json({
+      data: data || [],
       meta: {
-        q: qRaw || null,
         page,
         limit,
-        total: count ?? null,
-        returned: data?.length || 0,
-        has_more: typeof count === "number" ? to + 1 < count : null,
+        total,
+        has_more,
       },
-      data: data || [],
+      query: {
+        uid, // required by your contract (not used to filter this global dataset)
+        q: qRaw || null,
+        muscle: muscleRaw || null,
+        category: categoryRaw || null,
+      },
     });
   } catch (err) {
-    console.error("[/api/exercises] Server error:", err);
+    console.error("[/api/exercises] unexpected:", err);
     return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
 /**
  * GET /api/exercises/:id
- * Example: /api/exercises/3_4_Sit-Up
+ * Query: uid (required)
  */
 router.get("/:id", async (req, res) => {
   try {
-    const id = (req.params.id || "").toString();
+    const uid = requireUid(req, res);
+    if (!uid) return;
+
+    const id = (req.params.id || "").toString().trim();
+    if (!id) return res.status(400).json({ error: "Missing exercise id" });
 
     const { data, error } = await supabase
       .from("exercises_data")
@@ -114,17 +150,17 @@ router.get("/:id", async (req, res) => {
       .single();
 
     if (error) {
-      // not found
-      if (String(error.code) === "PGRST116") {
+      // not found vs real error
+      if (String(error.message || "").toLowerCase().includes("row")) {
         return res.status(404).json({ error: "Not found" });
       }
-      console.error("[/api/exercises/:id] Supabase error:", error);
-      return res.status(500).json({ error: error.message });
+      console.error("[/api/exercises/:id] supabase error:", error);
+      return res.status(500).json({ error: "DB error", details: error.message });
     }
 
-    return res.json({ data });
+    return res.json({ data, query: { uid } });
   } catch (err) {
-    console.error("[/api/exercises/:id] Server error:", err);
+    console.error("[/api/exercises/:id] unexpected:", err);
     return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
