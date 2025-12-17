@@ -2,24 +2,19 @@
 const supabase = require("./supabaseClient");
 
 function buildOrFilter(q) {
-  // PostgREST .or() string
-  // NOTE: arrays (primary_muscles etc) partial-match is tricky without a view.
-  // We’ll do strong scalar search via ilike, plus “contains” for arrays if query looks like a single token.
-  const escaped = q.replace(/[%_]/g, "\\$&"); // escape % _ for safety-ish
+  const escaped = q.replace(/[%_]/g, "\\$&");
   const like = `*${escaped}*`;
 
-  const scalarParts = [
+  return [
     `name.ilike.${like}`,
     `force.ilike.${like}`,
     `level.ilike.${like}`,
     `mechanic.ilike.${like}`,
     `equipment.ilike.${like}`,
     `category.ilike.${like}`,
-    // If you later add a generated column for arrays, you can include that here too.
-  ];
-
-  return scalarParts.join(",");
+  ].join(",");
 }
+
 
 function isSingleToken(q) {
   return !!q && !/\s/.test(q.trim());
