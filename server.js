@@ -34,8 +34,9 @@ const weeklyReportRoutes = require("./api/weeklyReportRoutes");
 app.use("/api/weekly-report", weeklyReportRoutes);
 
 // ---------- Workout Libary ----------
-const exercisesRoutes = require("./api/exercisesRoutes");
-app.use("/api/exercises", exercisesRoutes);
+const exerciseRoutes = require("./api/exerciseRoutes");
+app.use("/api/exercises", exerciseRoutes);
+
 
 
 // ---------- Health Auto Export Webhook ----------
