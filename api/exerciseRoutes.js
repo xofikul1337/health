@@ -18,7 +18,9 @@ function toInt(v, fallback) {
 function requireUid(req, res) {
   const uid = req.query.uid || req.headers["x-user-id"];
   if (!uid) {
-    res.status(400).json({ error: "Missing uid (user_id). Pass ?uid=... or x-user-id header." });
+    res
+      .status(400)
+      .json({ error: "Missing uid (user_id). Pass ?uid=... or x-user-id header." });
     return null;
   }
   return String(uid);
@@ -28,13 +30,18 @@ function requireUid(req, res) {
  * GET /api/exercises
  * Query:
  *  - uid (required)
- *  - q (optional) -> partial search across text columns
- *  - muscle (optional) -> exact match in primary_muscles or secondary_muscles
+ *  - q (optional)        -> partial search across text columns
+ *  - muscle (optional)   -> exact match in primary_muscles or secondary_muscles
  *  - category (optional) -> exact/partial category filter
  *  - page (optional, default 1)
  *  - limit (optional, default 20, max 50)
  *
- * Returns: { data: [...], meta: { page, limit, total, has_more }, query: {...} }
+ * Returns:
+ *  {
+ *    data: [...],
+ *    meta: { page, limit, total, has_more },
+ *    query: { ... }
+ *  }
  */
 router.get("/", async (req, res) => {
   try {
@@ -46,7 +53,10 @@ router.get("/", async (req, res) => {
     const categoryRaw = (req.query.category || "").toString().trim();
 
     const page = Math.max(1, toInt(req.query.page, 1));
-    const limit = Math.min(MAX_LIMIT, Math.max(1, toInt(req.query.limit, DEFAULT_LIMIT)));
+    const limit = Math.min(
+      MAX_LIMIT,
+      Math.max(1, toInt(req.query.limit, DEFAULT_LIMIT))
+    );
     const from = (page - 1) * limit;
     const to = from + limit - 1;
 
@@ -59,14 +69,10 @@ router.get("/", async (req, res) => {
       );
 
     // ----- Search (partial) -----
-    // Supabase OR filter: use ilike on text columns
     if (qRaw.length > 0) {
-      // avoid extremely broad queries (optional safety)
-      // if (qRaw.length < 2) { ... } // (তুমি চাইলে enable করতে পারো)
       const q = qRaw.replace(/[%_]/g, ""); // basic wildcard sanitization
       const like = `%${q}%`;
 
-      // NOTE: PostgREST "or" syntax
       query = query.or(
         [
           `id.ilike.${like}`,
@@ -86,15 +92,11 @@ router.get("/", async (req, res) => {
       query = query.ilike("category", `%${c}%`);
     }
 
-    // ----- Muscle filter (optional, exact match on arrays) -----
-    // This matches if primary_muscles contains [muscle] OR secondary_muscles contains [muscle]
+    // ----- Muscle filter (optional, array contains) -----
     if (muscleRaw.length > 0) {
       const m = muscleRaw.toLowerCase();
       query = query.or(
-        [
-          `primary_muscles.cs.{${m}}`,
-          `secondary_muscles.cs.{${m}}`,
-        ].join(",")
+        [`primary_muscles.cs.{${m}}`, `secondary_muscles.cs.{${m}}`].join(",")
       );
     }
 
@@ -127,7 +129,9 @@ router.get("/", async (req, res) => {
     });
   } catch (err) {
     console.error("[/api/exercises] unexpected:", err);
-    return res.status(500).json({ error: "Server error", details: err.message });
+    return res
+      .status(500)
+      .json({ error: "Server error", details: err.message || String(err) });
   }
 });
 
@@ -150,8 +154,8 @@ router.get("/:id", async (req, res) => {
       .single();
 
     if (error) {
-      // not found vs real error
-      if (String(error.message || "").toLowerCase().includes("row")) {
+      const msg = String(error.message || "").toLowerCase();
+      if (msg.includes("row") || msg.includes("no rows")) {
         return res.status(404).json({ error: "Not found" });
       }
       console.error("[/api/exercises/:id] supabase error:", error);
@@ -161,7 +165,96 @@ router.get("/:id", async (req, res) => {
     return res.json({ data, query: { uid } });
   } catch (err) {
     console.error("[/api/exercises/:id] unexpected:", err);
-    return res.status(500).json({ error: "Server error", details: err.message });
+    return res
+      .status(500)
+      .json({ error: "Server error", details: err.message || String(err) });
+  }
+});
+
+/**
+ * POST /api/exercises/favorite
+ *
+ * Query or Body:
+ *  - uid          (required)
+ *  - exercise_id  (required)
+ *  - favorite     (required) -> "true" or "false"
+ *
+ * Behavior:
+ *  - favorite=true  -> upsert into exercise_favorites
+ *  - favorite=false -> delete from exercise_favorites
+ */
+router.post("/favorite", async (req, res) => {
+  try {
+    const uid = req.body.uid || req.query.uid;
+    const exercise_id = req.body.exercise_id || req.query.exercise_id;
+    const favRaw = req.body.favorite || req.query.favorite;
+
+    if (!uid) {
+      return res.status(400).json({ error: "Missing uid" });
+    }
+    if (!exercise_id) {
+      return res.status(400).json({ error: "Missing exercise_id" });
+    }
+    if (favRaw === undefined || favRaw === null) {
+      return res.status(400).json({ error: "Missing favorite flag (true/false)" });
+    }
+
+    const favorite = String(favRaw).toLowerCase() === "true";
+
+    // favorite = true -> upsert
+    if (favorite) {
+      const { error } = await supabase
+        .from("exercise_favorites")
+        .upsert(
+          {
+            user_id: uid,
+            exercise_id: exercise_id,
+          },
+          { onConflict: "user_id,exercise_id" }
+        );
+
+      if (error) {
+        console.error("[/api/exercises/favorite] insert error:", error);
+        return res
+          .status(500)
+          .json({ error: "DB insert error", details: error.message });
+      }
+
+      return res.json({
+        success: true,
+        message: "Exercise added to favorites",
+        favorite: true,
+        user_id: uid,
+        exercise_id,
+      });
+    }
+
+    // favorite = false -> delete
+    const { error } = await supabase
+      .from("exercise_favorites")
+      .delete()
+      .eq("user_id", uid)
+      .eq("exercise_id", exercise_id);
+
+    if (error) {
+      console.error("[/api/exercises/favorite] delete error:", error);
+      return res
+        .status(500)
+        .json({ error: "DB delete error", details: error.message });
+    }
+
+    return res.json({
+      success: true,
+      message: "Exercise removed from favorites",
+      favorite: false,
+      user_id: uid,
+      exercise_id,
+    });
+  } catch (err) {
+    console.error("[/api/exercises/favorite] unexpected:", err);
+    return res
+      .status(500)
+      .json({ error: "Server error", details: err.message || String(err) });
   }
 });
 
