@@ -204,7 +204,7 @@ router.post("/favorite", async (req, res) => {
     // favorite = true -> upsert
     if (favorite) {
       const { error } = await supabase
-        .from("exercise_favorites")
+        .from("user_exercise_favorites")
         .upsert(
           {
             user_id: uid,
@@ -231,7 +231,7 @@ router.post("/favorite", async (req, res) => {
 
     // favorite = false -> delete
     const { error } = await supabase
-      .from("exercise_favorites")
+      .from("user_exercise_favorites")
       .delete()
       .eq("user_id", uid)
       .eq("exercise_id", exercise_id);
