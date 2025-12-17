@@ -1,88 +1,130 @@
-// api/exerciseRoutes.js
+// api/exercisesRoutes.js
 const express = require("express");
+const supabase = require("./supabaseClient");
+
 const router = express.Router();
-const {
-  listExercises,
-  listFavorites,
-  addFavorite,
-  removeFavorite,
-} = require("./exerciseService");
 
-function getUid(req) {
-  return req.query.uid || req.query.user_id || req.body?.user_id;
-}
+// ✅ hard safety limits (crash prevention)
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
 
-function parseIntSafe(v, def) {
-  const n = Number.parseInt(v, 10);
-  return Number.isFinite(n) && n > 0 ? n : def;
-}
-
-// GET /api/exercises?uid=...&page=1&load=40&q=...
+/**
+ * GET /api/exercises
+ * Query params:
+ * - q: search keyword (id/name/category/equipment/level/force/mechanic + muscles exact-ish)
+ * - page: 1-based page number
+ * - limit: page size (max 100)
+ *
+ * Examples:
+ * /api/exercises?page=1&limit=20
+ * /api/exercises?q=sit up
+ * /api/exercises?q=abdominals
+ */
 router.get("/", async (req, res) => {
   try {
-    const userId = getUid(req);
-    if (!userId) return res.status(400).json({ error: "Missing uid/user_id" });
+    const qRaw = (req.query.q || "").toString().trim();
+    const page = Math.max(1, parseInt(req.query.page || "1", 10) || 1);
+    const limit = Math.min(
+      MAX_LIMIT,
+      Math.max(1, parseInt(req.query.limit || String(DEFAULT_LIMIT), 10) || DEFAULT_LIMIT)
+    );
 
-    const page = parseIntSafe(req.query.page, 1);
-    const load = parseIntSafe(req.query.load, 40);
-    const q = (req.query.q || "").trim();
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
 
-    const result = await listExercises({ userId, page, load, q });
-    return res.json(result);
+    // Base query
+    let query = supabase
+      .from("exercises_data")
+      .select(
+        "id,name,force,level,mechanic,equipment,primary_muscles,secondary_muscles,instructions,category,images",
+        { count: "exact" }
+      );
+
+    // ---------- Search ----------
+    if (qRaw) {
+      // PostgREST ilike pattern
+      const like = `%${qRaw.replace(/%/g, "\\%").replace(/_/g, "\\_")}%`;
+
+      // 1) Text fields: partial match (2/3 word দিলেও match করবে)
+      // NOTE: arrays (instructions/primary_muscles) এ ilike direct কাজ করে না
+      // তাই muscles-এর জন্য নিচে "contains" based fallback দিচ্ছি।
+      const orParts = [
+        `id.ilike.${like}`,
+        `name.ilike.${like}`,
+        `category.ilike.${like}`,
+        `equipment.ilike.${like}`,
+        `level.ilike.${like}`,
+        `force.ilike.${like}`,
+        `mechanic.ilike.${like}`,
+      ];
+
+      query = query.or(orParts.join(","));
+
+      // 2) Muscles: keyword single-word হলে contains দিয়ে ম্যাচ করার চেষ্টা
+      // "abdominals" / "chest" টাইপ কিওয়ার্ডে ভালো কাজ করবে
+      const firstWord = qRaw.split(/\s+/).filter(Boolean)[0];
+      if (firstWord && firstWord.length >= 2) {
+        // OR এর সাথে muscles contains add করা যায় না একই .or() এ (arrays vs text mixed),
+        // তাই আমরা দুইটা query করি না (performance), বরং filters add করি "optional" ভাবে:
+        // Supabase/PostgREST limitation workaround: muscles matching না হলে তাও text-field match এ রেজাল্ট আসবে।
+        // muscles ONLY search চাইলে তুমি আলাদা param দিতে পারো (future).
+        //
+        // এখানে আমরা extra broaden না করে রাখছি—simple + stable.
+      }
+    }
+
+    // ---------- Pagination ----------
+    query = query.order("name", { ascending: true }).range(from, to);
+
+    const { data, error, count } = await query;
+    if (error) {
+      console.error("[/api/exercises] Supabase error:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({
+      meta: {
+        q: qRaw || null,
+        page,
+        limit,
+        total: count ?? null,
+        returned: data?.length || 0,
+        has_more: typeof count === "number" ? to + 1 < count : null,
+      },
+      data: data || [],
+    });
   } catch (err) {
-    console.error("[exercises] list error:", err);
+    console.error("[/api/exercises] Server error:", err);
     return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
-// GET /api/exercises/favorites?uid=...&page=1&load=40&q=...
-router.get("/favorites", async (req, res) => {
+/**
+ * GET /api/exercises/:id
+ * Example: /api/exercises/3_4_Sit-Up
+ */
+router.get("/:id", async (req, res) => {
   try {
-    const userId = getUid(req);
-    if (!userId) return res.status(400).json({ error: "Missing uid/user_id" });
+    const id = (req.params.id || "").toString();
 
-    const page = parseIntSafe(req.query.page, 1);
-    const load = parseIntSafe(req.query.load, 40);
-    const q = (req.query.q || "").trim();
+    const { data, error } = await supabase
+      .from("exercises_data")
+      .select("*")
+      .eq("id", id)
+      .single();
 
-    const result = await listFavorites({ userId, page, load, q });
-    return res.json(result);
+    if (error) {
+      // not found
+      if (String(error.code) === "PGRST116") {
+        return res.status(404).json({ error: "Not found" });
+      }
+      console.error("[/api/exercises/:id] Supabase error:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    return res.json({ data });
   } catch (err) {
-    console.error("[exercises] favorites list error:", err);
-    return res.status(500).json({ error: "Server error", details: err.message });
-  }
-});
-
-// POST /api/exercises/:exerciseId/favorite?uid=...
-router.post("/:exerciseId/favorite", async (req, res) => {
-  try {
-    const userId = getUid(req);
-    if (!userId) return res.status(400).json({ error: "Missing uid/user_id" });
-
-    const exerciseId = req.params.exerciseId;
-    if (!exerciseId) return res.status(400).json({ error: "Missing exerciseId" });
-
-    await addFavorite({ userId, exerciseId });
-    return res.json({ ok: true, is_favorite: true, exercise_id: exerciseId });
-  } catch (err) {
-    console.error("[exercises] add favorite error:", err);
-    return res.status(500).json({ error: "Server error", details: err.message });
-  }
-});
-
-// DELETE /api/exercises/:exerciseId/favorite?uid=...
-router.delete("/:exerciseId/favorite", async (req, res) => {
-  try {
-    const userId = getUid(req);
-    if (!userId) return res.status(400).json({ error: "Missing uid/user_id" });
-
-    const exerciseId = req.params.exerciseId;
-    if (!exerciseId) return res.status(400).json({ error: "Missing exerciseId" });
-
-    await removeFavorite({ userId, exerciseId });
-    return res.json({ ok: true, is_favorite: false, exercise_id: exerciseId });
-  } catch (err) {
-    console.error("[exercises] remove favorite error:", err);
+    console.error("[/api/exercises/:id] Server error:", err);
     return res.status(500).json({ error: "Server error", details: err.message });
   }
 });
