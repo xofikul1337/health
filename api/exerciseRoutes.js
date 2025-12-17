@@ -106,6 +106,59 @@ router.get("/", async (req, res) => {
   }
 });
 
+//Favoroutie List
+
+// GET /api/exercises/favorites
+router.get("/favorites", async (req, res) => {
+  try {
+    const uid = req.query.uid;
+    if (!uid) return res.status(400).json({ error: "Missing uid" });
+
+    const page = Math.max(1, parseInt(req.query.page || "1", 10));
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit || "20", 10)));
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+
+    const { data, error, count } = await supabase
+      .from("user_exercise_favorites")
+      .select(
+        `
+        exercise_id,
+        exercises_data:exercise_id (
+          id,name,force,level,mechanic,equipment,
+          primary_muscles,secondary_muscles,instructions,category,images
+        )
+        `,
+        { count: "exact" }
+      )
+      .eq("user_id", uid)
+      .eq("is_favorite", true)
+      .order("updated_at", { ascending: false })
+      .range(from, to);
+
+    if (error) {
+      console.error("Favorite list error:", error);
+      return res.status(500).json({ error: "DB error", details: error.message });
+    }
+
+    const rows = (data || []).map((r) => r.exercises_data).filter(Boolean);
+
+    return res.json({
+      data: rows,
+      meta: {
+        page,
+        limit,
+        total: count ?? 0,
+        has_more: from + rows.length < (count ?? 0),
+      },
+      query: { uid },
+    });
+  } catch (err) {
+    console.error("Favorite list unexpected:", err);
+    return res.status(500).json({ error: "Server error", details: err.message });
+  }
+});
+
 /* ============================================================
    GET /api/exercises/:id
 ============================================================ */
