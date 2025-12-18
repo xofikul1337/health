@@ -31,7 +31,8 @@ const readinessRoutes = require("./api/readinessRoutes");
 app.use("/api/readiness", readinessRoutes);
 // ---------- Weekly Rotues ----------
 const weeklyReportRoutes = require("./api/weeklyReportRoutes");
-app.use("/api/weekly-report", weeklyReportRoutes);
+app.use("/api/weekly-reports", weeklyReportRoutes);
+
 
 // ---------- Workout Libary ----------
 const exerciseRoutes = require("./api/exerciseRoutes");
