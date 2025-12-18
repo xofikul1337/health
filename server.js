@@ -21,7 +21,6 @@ app.use(express.json({ limit: "50mb" }));
 app.use(cors());
 app.set("trust proxy", 1);
 
-
 // ---------- KnowledgeBase AI (plug-in) ----------
 const aiChatRoutes = require("./api/aiChatRoutes");
 app.use("/api/chat", aiChatRoutes);
@@ -33,12 +32,9 @@ app.use("/api/readiness", readinessRoutes);
 const weeklyReportRoutes = require("./api/weeklyReportRoutes");
 app.use("/api/weekly-reports", weeklyReportRoutes);
 
-
 // ---------- Workout Libary ----------
 const exerciseRoutes = require("./api/exerciseRoutes");
 app.use("/api/exercises", exerciseRoutes);
-
-
 
 // ---------- Health Auto Export Webhook ----------
 app.post("/api/health-data", async (req, res) => {
@@ -118,6 +114,8 @@ app.post("/api/health-data", async (req, res) => {
 
           resting_hr: null,
           hrv: null,
+
+          _hrv_values: [], // ✅ NEW: collect HRV datapoints for the day
 
           sleep_duration_minutes: 0,
           sleep_deep_minutes: 0,
@@ -249,12 +247,15 @@ app.post("/api/health-data", async (req, res) => {
           row.resting_hr = Number(value);
         }
 
-        // 2) HRV
+        // 2) HRV ✅ FIX: collect all HRV points, don't overwrite last value
         if (
           name.includes("heart_rate_variability_sdnn") ||
           name === "heart_rate_variability"
         ) {
-          row.hrv = Number(value);
+          const v = Number(value);
+          if (Number.isFinite(v)) {
+            row._hrv_values.push(v);
+          }
         }
 
         // 3) Steps
@@ -303,6 +304,22 @@ app.post("/api/health-data", async (req, res) => {
     if (rows.length === 0) {
       console.warn("[/api/health-data] No valid summary rows generated.");
       return res.json({ message: "No valid data to insert" });
+    }
+
+    // ✅ NEW: finalize HRV = median of the day's HRV datapoints
+    for (const r of rows) {
+      const arr = Array.isArray(r._hrv_values) ? r._hrv_values : [];
+      if (arr.length > 0) {
+        const sorted = [...arr].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const median =
+          sorted.length % 2 !== 0
+            ? sorted[mid]
+            : (sorted[mid - 1] + sorted[mid]) / 2;
+
+        r.hrv = median;
+      }
+      delete r._hrv_values; // don't store internal array in DB
     }
 
     // integer-safe fields
