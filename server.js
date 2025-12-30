@@ -8,7 +8,9 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseUrl || !supabaseServiceRoleKey) {
-  console.warn("[server] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars");
+  console.warn(
+    "[server] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars"
+  );
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
@@ -19,31 +21,6 @@ app.use(express.json({ limit: "50mb" }));
 app.use(cors());
 app.set("trust proxy", 1);
 
-// ---------- THOR API Key Gate (protect internal APIs) ----------
-const THOR_API_KEY = process.env.THOR_API_KEY || "";
-
-function requireThorKey(req, res, next) {
-  // Dev-friendly: if server key not set, don't block
-  if (!THOR_API_KEY) return next();
-
-  const p = req.path || "";
-
-  // Allow public endpoints
-  // - Health check
-  // - Apple Health auto-export webhook (external caller may not send header)
-  if (p === "/" || p.startsWith("/api/health-data")) return next();
-
-  // Require x-thor-api-key for all other routes
-  const key = req.headers["x-thor-api-key"];
-  if (!key || key !== THOR_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized (missing/invalid x-thor-api-key)" });
-  }
-  next();
-}
-
-// Apply gate globally (before /api routes)
-app.use(requireThorKey);
-
 // ---------- KnowledgeBase AI (plug-in) ----------
 const aiChatRoutes = require("./api/aiChatRoutes");
 app.use("/api/chat", aiChatRoutes);
@@ -51,7 +28,6 @@ app.use("/api/chat", aiChatRoutes);
 // ---------- Readiness Routes (plug-in) ----------
 const readinessRoutes = require("./api/readinessRoutes");
 app.use("/api/readiness", readinessRoutes);
-
 // ---------- Weekly Rotues ----------
 const weeklyReportRoutes = require("./api/weeklyReportRoutes");
 app.use("/api/weekly-reports", weeklyReportRoutes);
@@ -60,16 +36,15 @@ app.use("/api/weekly-reports", weeklyReportRoutes);
 const exerciseRoutes = require("./api/exerciseRoutes");
 app.use("/api/exercises", exerciseRoutes);
 
-// ---------- Trends Routes (NEW) ----------
-const trendsRoutes = require("./api/trendsRoutes")(supabase);
-app.use("/api/trends", trendsRoutes);
-
 // ---------- Health Auto Export Webhook ----------
 app.post("/api/health-data", async (req, res) => {
   try {
     // 1) Raw snapshot log (limited)
     const rawSnapshot = JSON.stringify(req.body).slice(0, 5000);
-    console.log("[/api/health-data] RAW payload snapshot (first 5000 chars):", rawSnapshot);
+    console.log(
+      "[/api/health-data] RAW payload snapshot (first 5000 chars):",
+      rawSnapshot
+    );
 
     const payload = req.body;
     const metrics = payload?.data?.metrics || payload?.metrics || [];
@@ -86,7 +61,9 @@ app.post("/api/health-data", async (req, res) => {
     );
 
     if (!userId) {
-      console.warn("[/api/health-data] Missing user_id/uid. Rejecting request.");
+      console.warn(
+        "[/api/health-data] Missing user_id/uid. Rejecting request."
+      );
       return res.status(400).json({ error: "Missing user_id/uid" });
     }
 
@@ -105,7 +82,10 @@ app.post("/api/health-data", async (req, res) => {
 
     const metricNames = metrics.map((m) => m.name).filter(Boolean);
     console.log("[/api/health-data] Metric names:", metricNames);
-    console.log("[/api/health-data] Sample metrics (first 3):", JSON.stringify(metrics.slice(0, 3), null, 2));
+    console.log(
+      "[/api/health-data] Sample metrics (first 3):",
+      JSON.stringify(metrics.slice(0, 3), null, 2)
+    );
 
     // ---------- Per-day summary aggregator ----------
     const summary = {};
@@ -135,13 +115,13 @@ app.post("/api/health-data", async (req, res) => {
           resting_hr: null,
           hrv: null,
 
-          _hrv_values: [], // collect HRV datapoints for the day
+          _hrv_values: [], // ✅ NEW: collect HRV datapoints for the day
 
           sleep_duration_minutes: 0,
           sleep_deep_minutes: 0,
           sleep_rem_minutes: 0,
           sleep_core_minutes: 0,
-          sleep_awake_minutes: 0,
+          sleep_awake_minutes: 0, // ✅ new
 
           systolic: null,
           diastolic: null,
@@ -182,22 +162,30 @@ app.post("/api/health-data", async (req, res) => {
 
       const isKnown = knownNames.some((k) => name === k || name.includes(k));
       if (!isKnown) {
-        console.log("[/api/health-data] Unknown metric name from Auto Export:", metric.name);
+        console.log(
+          "[/api/health-data] Unknown metric name from Auto Export:",
+          metric.name
+        );
       }
 
       const dataPoints = metric.data || [];
       if (!Array.isArray(dataPoints) || dataPoints.length === 0) continue;
 
       for (const d of dataPoints) {
+        // ✅ dateStr: we try multiple keys
         const dateStr = d.date || d.end || d.endDate || d.start || d.startDate;
         if (!dateStr) continue;
 
-        // Sleep
+        // ✅ Sleep special-case: we bucket by END if possible (important)
         if (name.includes("sleep_analysis")) {
-          const sleepBucketDateStr = d.date || d.end || d.endDate || d.start || d.startDate;
+          const sleepBucketDateStr =
+            d.date || d.end || d.endDate || d.start || d.startDate;
+
           const sleepRow = ensureDay(sleepBucketDateStr);
           if (!sleepRow) continue;
 
+          // (A) Summary-object format (units: "hr")
+          // Example: { totalSleep, deep, rem, core, awake, date: "..." }
           const hasSummaryHours =
             typeof d.totalSleep === "number" ||
             typeof d.deep === "number" ||
@@ -212,14 +200,17 @@ app.post("/api/health-data", async (req, res) => {
             const coreMin = Math.round((Number(d.core) || 0) * 60);
             const awakeMin = Math.round((Number(d.awake) || 0) * 60);
 
+            // overwrite (summary = total for that day)
             sleepRow.sleep_duration_minutes = totalMin;
             sleepRow.sleep_deep_minutes = deepMin;
             sleepRow.sleep_rem_minutes = remMin;
             sleepRow.sleep_core_minutes = coreMin;
             sleepRow.sleep_awake_minutes = awakeMin;
+
             continue;
           }
 
+          // (B) Segment format with start/end + stage value
           const start = new Date(d.start || d.startDate);
           const end = new Date(d.end || d.endDate);
           if (isNaN(start) || isNaN(end)) continue;
@@ -230,6 +221,7 @@ app.post("/api/health-data", async (req, res) => {
           sleepRow.sleep_duration_minutes += minutes;
 
           const stage = d.value;
+          // 0 = awake, 1 = asleep, 2 = core, 3 = deep, 4 = rem
           if (stage === 0 || String(stage).toLowerCase() === "awake") {
             sleepRow.sleep_awake_minutes += minutes;
           } else if (stage === 3 || String(stage) === "Deep") {
@@ -243,65 +235,70 @@ app.post("/api/health-data", async (req, res) => {
           continue;
         }
 
-        // Non-sleep metrics
+        // ---------- Non-sleep metrics ----------
         const row = ensureDay(dateStr);
         if (!row) continue;
 
         const value = d.qty ?? d.avg ?? d.value ?? d.min ?? d.max ?? null;
         if (value == null) continue;
 
-        // Resting HR
+        // 1) Resting HR
         if (name.includes("resting_heart_rate")) {
           row.resting_hr = Number(value);
         }
 
-        // HRV (collect)
-        if (name.includes("heart_rate_variability_sdnn") || name === "heart_rate_variability") {
+        // 2) HRV ✅ FIX: collect all HRV points, don't overwrite last value
+        if (
+          name.includes("heart_rate_variability_sdnn") ||
+          name === "heart_rate_variability"
+        ) {
           const v = Number(value);
-          if (Number.isFinite(v)) row._hrv_values.push(v);
+          if (Number.isFinite(v)) {
+            row._hrv_values.push(v);
+          }
         }
 
-        // Steps
+        // 3) Steps
         if (name.includes("step_count")) {
           row.steps += Number(value || 0);
         }
 
-        // Active calories
+        // 4) Active calories
         if (name.includes("active_energy_burned") || name === "active_energy") {
           row.active_calories += Number(value || 0);
         }
 
-        // Basal calories
+        // 5) Basal calories
         if (name.includes("basal_energy_burned")) {
           row.basal_calories += Number(value || 0);
         }
 
-        // Weight
+        // 6) Weight
         if (name.includes("body_mass") || name.includes("weight_body_mass")) {
           row.weight = Number(value);
         }
 
-        // Body fat %
+        // 7) Body fat %
         if (name.includes("body_fat_percentage")) {
           row.body_fat_percentage = Number(value);
         }
 
-        // Glucose
+        // 8) Glucose
         if (name.includes("blood_glucose")) {
           row.glucose = Number(value);
         }
 
-        // Blood pressure
+        // 9) Blood pressure
         if (name.includes("blood_pressure_systolic")) {
           row.systolic = Number(value);
         }
         if (name.includes("blood_pressure_diastolic")) {
           row.diastolic = Number(value);
         }
-      }
-    }
+      } // ✅ end for d
+    } // ✅ end for metric
 
-    // Build rows & sanitize
+    // ---------- Build rows & sanitize ----------
     let rows = Object.values(summary);
 
     if (rows.length === 0) {
@@ -309,18 +306,23 @@ app.post("/api/health-data", async (req, res) => {
       return res.json({ message: "No valid data to insert" });
     }
 
-    // finalize HRV = median of day
+    // ✅ NEW: finalize HRV = median of the day's HRV datapoints
     for (const r of rows) {
       const arr = Array.isArray(r._hrv_values) ? r._hrv_values : [];
       if (arr.length > 0) {
         const sorted = [...arr].sort((a, b) => a - b);
         const mid = Math.floor(sorted.length / 2);
-        const median = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        const median =
+          sorted.length % 2 !== 0
+            ? sorted[mid]
+            : (sorted[mid - 1] + sorted[mid]) / 2;
+
         r.hrv = median;
       }
-      delete r._hrv_values;
+      delete r._hrv_values; // don't store internal array in DB
     }
 
+    // integer-safe fields
     rows = rows.map((r) => ({
       ...r,
       steps: Math.round(r.steps || 0),
@@ -334,13 +336,19 @@ app.post("/api/health-data", async (req, res) => {
       sleep_awake_minutes: Math.round(r.sleep_awake_minutes || 0),
     }));
 
-    console.log("[/api/health-data] Prepared summary rows for dates:", rows.map((r) => r.date));
-    console.log("[/api/health-data] Example row:", JSON.stringify(rows[0], null, 2));
+    console.log(
+      "[/api/health-data] Prepared summary rows for dates:",
+      rows.map((r) => r.date)
+    );
+    console.log(
+      "[/api/health-data] Example row:",
+      JSON.stringify(rows[0], null, 2)
+    );
 
-    // Upsert
+    // ---------- Upsert into Supabase ----------
     const { error } = await supabase
       .from("daily_health_summary")
-      .upsert(rows, { onConflict: "user_id,date" });
+      .upsert(rows, { onConflict: "user_id,date" }); // UNIQUE(user_id,date)
 
     if (error) {
       console.error(
@@ -352,7 +360,12 @@ app.post("/api/health-data", async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
-    console.log("[/api/health-data] Upsert success. user_id:", userId, "rows:", rows.length);
+    console.log(
+      "[/api/health-data] Upsert success. user_id:",
+      userId,
+      "rows:",
+      rows.length
+    );
 
     return res.json({
       message: "Success",
@@ -360,7 +373,10 @@ app.post("/api/health-data", async (req, res) => {
       dates: rows.map((r) => r.date).sort(),
     });
   } catch (err) {
-    console.error("[/api/health-data] Unexpected error while processing payload:", err);
+    console.error(
+      "[/api/health-data] Unexpected error while processing payload:",
+      err
+    );
     return res.status(500).json({
       error: "Server error",
       details: err.message,
