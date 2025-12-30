@@ -21,6 +21,12 @@ app.use(express.json({ limit: "50mb" }));
 app.use(cors());
 app.set("trust proxy", 1);
 
+// ---------- Push Notification (plug-in) ----------
+
+const pushRoutes = require("./api/pushRoutes");
+app.use("/api/push", pushRoutes);
+
+
 // ---------- KnowledgeBase AI (plug-in) ----------
 const aiChatRoutes = require("./api/aiChatRoutes");
 app.use("/api/chat", aiChatRoutes);
