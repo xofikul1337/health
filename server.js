@@ -23,7 +23,7 @@ app.set("trust proxy", 1);
 
 // ---------- Push Notification (plug-in) ----------
 
-const pushRoutes = require("./api/pushRoutes");
+const pushRoutes = require("./api/push/pushRoutes");
 app.use("/api/push", pushRoutes);
 
 
